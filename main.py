@@ -28,21 +28,11 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY != "your_openai
 USER_ID = "clarifai"
 APP_ID = "main"
 
-# Multiple models for better accuracy
-MODELS = [
+# Multiple Clarifai models
+CLARIFAI_MODELS = [
     {"id": "food-item-recognition", "weight": 1.0},
     {"id": "general", "weight": 0.8},
 ]
-
-# Food-related keywords to prioritize
-FOOD_KEYWORDS = {
-    'fruits': ['apple', 'banana', 'orange', 'grape', 'strawberry', 'lemon', 'lime', 'pear', 'peach', 'cherry', 'berries'],
-    'vegetables': ['carrot', 'broccoli', 'lettuce', 'tomato', 'onion', 'potato', 'pepper', 'cucumber', 'spinach', 'celery', 'corn', 'beans'],
-    'dairy': ['milk', 'cheese', 'butter', 'yogurt', 'cream', 'egg', 'eggs', 'sour cream'],
-    'meat': ['chicken', 'beef', 'pork', 'fish', 'turkey', 'salmon', 'bacon', 'ham', 'sausage'],
-    'pantry': ['bread', 'pasta', 'rice', 'flour', 'sugar', 'salt', 'oil', 'vinegar', 'sauce', 'condiment'],
-    'beverages': ['juice', 'soda', 'water', 'beer', 'wine', 'coffee', 'tea', 'milk']
-}
 
 def preprocess_image(image_bytes):
     """Enhance image for better recognition"""
@@ -52,11 +42,14 @@ def preprocess_image(image_bytes):
         if img.mode != 'RGB':
             img = img.convert('RGB')
         
-        # Enhance brightness and contrast
+        # More aggressive enhancement for better AI detection
         enhancer = ImageEnhance.Brightness(img)
-        img = enhancer.enhance(1.2)
+        img = enhancer.enhance(1.3)
         
         enhancer = ImageEnhance.Contrast(img)
+        img = enhancer.enhance(1.2)
+        
+        enhancer = ImageEnhance.Sharpness(img)
         img = enhancer.enhance(1.1)
         
         # Convert back to bytes
@@ -69,81 +62,93 @@ def preprocess_image(image_bytes):
         print(f"Image preprocessing failed: {e}")
         return image_bytes
 
-def is_food_related(concept_name):
-    """Check if a concept is food-related"""
-    concept_lower = concept_name.lower()
+def query_clarifai_models(image_base64):
+    """Query all Clarifai models simultaneously"""
+    clarifai_results = []
     
-    for category, keywords in FOOD_KEYWORDS.items():
-        for keyword in keywords:
-            if keyword in concept_lower or concept_lower in keyword:
-                return True, category
-    
-    food_terms = ['food', 'ingredient', 'meal', 'dish', 'recipe', 'cooking', 'fresh', 'organic']
-    for term in food_terms:
-        if term in concept_lower:
-            return True, 'general_food'
-    
-    return False, None
-
-def query_clarifai_model(image_base64, model_id):
-    """Query a specific Clarifai model"""
     headers = {
         "Authorization": f"Key {CLARIFAI_API_KEY}",
         "Content-Type": "application/json"
     }
-
-    url = f"https://api.clarifai.com/v2/users/{USER_ID}/apps/{APP_ID}/models/{model_id}/outputs"
     
-    payload = {
-        "inputs": [
-            {
-                "data": {
-                    "image": {
-                        "base64": image_base64
+    for model_info in CLARIFAI_MODELS:
+        model_id = model_info["id"]
+        weight = model_info["weight"]
+        
+        url = f"https://api.clarifai.com/v2/users/{USER_ID}/apps/{APP_ID}/models/{model_id}/outputs"
+        
+        payload = {
+            "inputs": [
+                {
+                    "data": {
+                        "image": {
+                            "base64": image_base64
+                        }
                     }
                 }
-            }
-        ]
-    }
+            ]
+        }
 
-    try:
-        response = requests.post(url, json=payload, headers=headers, timeout=30)
-        return response.json() if response.status_code == 200 else None
-    except Exception as e:
-        print(f"Error querying model {model_id}: {e}")
-        return None
+        try:
+            print(f"🔍 Querying Clarifai model: {model_id}")
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
+            
+            if response.status_code == 200:
+                result = response.json()
+                outputs = result.get('outputs', [])
+                if outputs:
+                    concepts = outputs[0].get('data', {}).get('concepts', [])
+                    for concept in concepts:
+                        if concept['value'] > 0.15:  # Filter low confidence
+                            clarifai_results.append({
+                                'name': concept['name'],
+                                'confidence': round(concept['value'] * 100 * weight, 1),
+                                'source': 'clarifai',
+                                'model': model_id
+                            })
+                print(f"✅ {model_id} returned {len(concepts)} concepts")
+            else:
+                print(f"❌ {model_id} failed: {response.status_code}")
+                
+        except Exception as e:
+            print(f"❌ {model_id} error: {e}")
+    
+    return clarifai_results
 
-def analyze_with_openai_vision(image_base64, clarifai_results=None):
-    """Use OpenAI Vision to analyze the image and validate/enhance results"""
+def query_openai_vision(image_base64):
+    """Use OpenAI Vision for comprehensive food detection"""
     if not openai_client:
-        return None
+        print("❌ OpenAI client not available")
+        return []
     
     try:
-        # Prepare the prompt
-        base_prompt = """
-        Analyze this refrigerator/kitchen image and identify food ingredients that could be used for cooking meals. 
-        Focus on:
-        1. Fresh produce (fruits, vegetables)
-        2. Dairy products (milk, cheese, eggs, yogurt)
-        3. Meat/protein items
-        4. Pantry staples visible
-        5. Condiments and sauces
+        print("🧠 Querying OpenAI Vision...")
         
-        Please be specific and practical - only list items that are clearly visible and would be useful for meal planning.
-        Return your response as a JSON object with this format:
-        {
-            "food_items": [
-                {"name": "item_name", "confidence": 95, "category": "vegetables"},
-                ...
-            ],
-            "analysis": "Brief description of what you see"
-        }
+        prompt = """
+        Analyze this refrigerator/kitchen image and identify ALL food ingredients that could be used for cooking.
+        
+        Focus on detecting:
+        - Fresh produce (fruits, vegetables, herbs)
+        - Dairy products (milk, cheese, eggs, yogurt, butter)
+        - Meat and proteins (chicken, beef, fish, tofu)
+        - Pantry items (bread, pasta, rice, sauces)
+        - Beverages (juice, milk, water)
+        - Condiments and seasonings
+        - Leftovers and prepared foods
+        - Canned/packaged goods
+        
+        Be very thorough and specific. Look carefully at containers, packages, and fresh items.
+        Consider items that might be partially visible or in the background.
+        
+        Return ONLY a JSON array of objects with this exact format:
+        [
+            {"name": "milk", "confidence": 95},
+            {"name": "eggs", "confidence": 90},
+            {"name": "carrots", "confidence": 85}
+        ]
+        
+        Include confidence scores from 60-99 based on how clearly visible and certain each item is.
         """
-        
-        # Add Clarifai comparison if available
-        if clarifai_results:
-            clarifai_items = [item['name'] for item in clarifai_results if item.get('is_food')]
-            base_prompt += f"\n\nFor comparison, another AI detected these items: {clarifai_items}. Please validate and provide your own analysis."
 
         response = openai_client.chat.completions.create(
             model="gpt-4-vision-preview",
@@ -151,7 +156,7 @@ def analyze_with_openai_vision(image_base64, clarifai_results=None):
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": base_prompt},
+                        {"type": "text", "text": prompt},
                         {
                             "type": "image_url",
                             "image_url": {
@@ -162,78 +167,108 @@ def analyze_with_openai_vision(image_base64, clarifai_results=None):
                     ]
                 }
             ],
-            max_tokens=1000,
-            temperature=0.3
+            max_tokens=1500,
+            temperature=0.2
         )
         
-        # Parse the JSON response
-        content = response.choices[0].message.content
-        print(f"OpenAI raw response: {content}")
+        content = response.choices[0].message.content.strip()
+        print(f"🧠 OpenAI raw response: {content[:200]}...")
         
-        # Try to extract JSON from the response
+        # Parse JSON response
         try:
-            # Find JSON in the response (might be wrapped in markdown)
+            # Try to find JSON array in the response
             import re
-            json_match = re.search(r'\{.*\}', content, re.DOTALL)
+            json_match = re.search(r'\[.*\]', content, re.DOTALL)
             if json_match:
                 json_str = json_match.group()
-                result = json.loads(json_str)
-                return result
-        except:
-            pass
-        
-        # Fallback: parse as plain text
-        return {
-            "food_items": [],
-            "analysis": content,
-            "raw_response": True
-        }
+                items = json.loads(json_str)
+                
+                openai_results = []
+                for item in items:
+                    if isinstance(item, dict) and 'name' in item:
+                        openai_results.append({
+                            'name': item['name'],
+                            'confidence': item.get('confidence', 80),
+                            'source': 'openai'
+                        })
+                
+                print(f"✅ OpenAI detected {len(openai_results)} items")
+                return openai_results
+            else:
+                print("❌ Could not parse OpenAI JSON response")
+                return []
+                
+        except json.JSONDecodeError as e:
+            print(f"❌ OpenAI JSON parse error: {e}")
+            return []
         
     except Exception as e:
-        print(f"OpenAI Vision API error: {e}")
-        return None
+        print(f"❌ OpenAI Vision error: {e}")
+        return []
 
-def combine_ai_results(clarifai_results, openai_result):
-    """Intelligently combine results from both AI systems"""
-    if not openai_result:
-        return clarifai_results
+def merge_duplicate_items(all_items):
+    """Smart merging of duplicate items from different AI sources"""
+    merged = {}
     
-    # Start with Clarifai results
-    combined = {}
-    
-    # Add Clarifai results
-    for item in clarifai_results:
-        name = item['name'].lower()
-        combined[name] = {
-            'name': item['name'],
-            'confidence': item['confidence'],
-            'source': 'clarifai',
-            'is_food': item['is_food'],
-            'category': item.get('category', 'unknown')
+    for item in all_items:
+        name = item['name'].lower().strip()
+        
+        # Handle common variations and synonyms
+        name_variations = {
+            'egg': 'eggs',
+            'carrot': 'carrots',
+            'tomato': 'tomatoes',
+            'potato': 'potatoes',
+            'onion': 'onions',
+            'bell pepper': 'pepper',
+            'red pepper': 'pepper',
+            'green pepper': 'pepper',
+            'whole milk': 'milk',
+            '2% milk': 'milk',
+            'skim milk': 'milk',
+            'cheddar cheese': 'cheese',
+            'mozzarella cheese': 'cheese',
+            'chicken breast': 'chicken',
+            'ground beef': 'beef',
+            'white bread': 'bread',
+            'wheat bread': 'bread',
         }
-    
-    # Add/enhance with OpenAI results
-    if 'food_items' in openai_result:
-        for item in openai_result['food_items']:
-            name = item['name'].lower()
-            confidence = item.get('confidence', 80)
+        
+        # Normalize name
+        normalized_name = name_variations.get(name, name)
+        
+        if normalized_name in merged:
+            existing = merged[normalized_name]
             
-            if name in combined:
-                # Boost confidence if both AIs agree
-                combined[name]['confidence'] = min(95, combined[name]['confidence'] * 1.3)
-                combined[name]['source'] = 'both_ais'
+            # Boost confidence when multiple AIs detect the same item
+            if item['source'] != existing['source']:
+                # Different sources agree - high confidence boost
+                confidence_boost = 1.4
+                existing['sources'].append(item['source'])
+                existing['source'] = 'both_ais'
             else:
-                # Add new item from OpenAI
-                combined[name] = {
-                    'name': item['name'],
-                    'confidence': confidence,
-                    'source': 'openai',
-                    'is_food': True,
-                    'category': item.get('category', 'general_food')
-                }
+                # Same source, multiple models - moderate boost
+                confidence_boost = 1.2
+            
+            # Take the higher confidence and boost it
+            new_confidence = max(existing['confidence'], item['confidence']) * confidence_boost
+            existing['confidence'] = min(99, round(new_confidence, 1))
+            
+            # Use the more descriptive name
+            if len(item['name']) > len(existing['name']):
+                existing['name'] = item['name']
+                
+        else:
+            merged[normalized_name] = {
+                'name': item['name'],
+                'confidence': item['confidence'],
+                'source': item['source'],
+                'sources': [item['source']],
+                'normalized_key': normalized_name
+            }
     
     # Convert back to list and sort by confidence
-    final_results = list(combined.values())
+    final_results = list(merged.values())
     final_results.sort(key=lambda x: x['confidence'], reverse=True)
     
     return final_results
@@ -241,127 +276,113 @@ def combine_ai_results(clarifai_results, openai_result):
 @app.post("/detect_foods")
 async def detect_foods(file: UploadFile = File(...)):
     try:
+        print(f"\n🚀 Starting AI-driven analysis for: {file.filename}")
+        
         # Read and preprocess image
         contents = await file.read()
         enhanced_contents = preprocess_image(contents)
-        image_bytes_base64 = base64.b64encode(enhanced_contents).decode("utf-8")
-
-        print(f"Processing image: {file.filename}")
+        image_base64 = base64.b64encode(enhanced_contents).decode("utf-8")
         
-        # Step 1: Query Clarifai models
-        clarifai_results = []
-        model_results = []
+        # Run both AI systems simultaneously
+        all_detected_items = []
         
-        for model_info in MODELS:
-            model_id = model_info["id"]
-            weight = model_info["weight"]
-            
-            print(f"Querying Clarifai model: {model_id}")
-            result = query_clarifai_model(image_bytes_base64, model_id)
-            
-            if result:
-                model_results.append((result, weight))
-
-        # Process Clarifai results
-        if model_results:
-            combined_concepts = {}
-            
-            for model_data, weight in model_results:
-                outputs = model_data.get('outputs', [])
-                if not outputs:
-                    continue
-                    
-                concepts = outputs[0].get('data', {}).get('concepts', [])
-                
-                for concept in concepts:
-                    name = concept['name']
-                    confidence = concept['value'] * weight
-                    is_food, category = is_food_related(name)
-                    
-                    if is_food and confidence > 0.15:
-                        if name in combined_concepts:
-                            combined_concepts[name]['confidence'] = max(
-                                combined_concepts[name]['confidence'], 
-                                confidence
-                            )
-                        else:
-                            combined_concepts[name] = {
-                                'name': name,
-                                'confidence': round(confidence * 100, 1),
-                                'is_food': is_food,
-                                'category': category
-                            }
-            
-            clarifai_results = list(combined_concepts.values())
-            clarifai_results.sort(key=lambda x: x['confidence'], reverse=True)
-
-        # Step 2: Determine if we need AI backup
-        max_confidence = max([r['confidence'] for r in clarifai_results], default=0)
-        should_use_ai = (
-            max_confidence < 60 or  # Low confidence
-            len(clarifai_results) < 3 or  # Few items detected
-            openai_client is not None  # AI is available
-        )
-
-        openai_result = None
-        if should_use_ai:
-            print("Using OpenAI Vision for enhanced analysis...")
-            openai_result = analyze_with_openai_vision(image_bytes_base64, clarifai_results)
-
-        # Step 3: Combine results intelligently
-        if openai_result:
-            final_results = combine_ai_results(clarifai_results, openai_result)
-        else:
-            final_results = clarifai_results
-
-        # Step 4: Categorize final results
-        high_confidence = [item for item in final_results if item["confidence"] > 70]
-        medium_confidence = [item for item in final_results if 40 <= item["confidence"] <= 70]
-        low_confidence = [item for item in final_results if 20 <= item["confidence"] < 40]
-
-        response_data = {
-            "items": [item["name"] for item in final_results],
-            "food_items": final_results,
+        # Get Clarifai results
+        clarifai_items = query_clarifai_models(image_base64)
+        all_detected_items.extend(clarifai_items)
+        
+        # Get OpenAI results
+        openai_items = query_openai_vision(image_base64)
+        all_detected_items.extend(openai_items)
+        
+        print(f"\n📊 Raw Detection Results:")
+        print(f"Clarifai detected: {len(clarifai_items)} items")
+        print(f"OpenAI detected: {len(openai_items)} items")
+        print(f"Total raw items: {len(all_detected_items)}")
+        
+        # Merge duplicates and boost confidence for agreements
+        merged_results = merge_duplicate_items(all_detected_items)
+        
+        print(f"Final merged items: {len(merged_results)}")
+        
+        # Categorize by confidence levels
+        high_confidence = [item for item in merged_results if item['confidence'] >= 75]
+        medium_confidence = [item for item in merged_results if 50 <= item['confidence'] < 75]
+        low_confidence = [item for item in merged_results if 30 <= item['confidence'] < 50]
+        
+        # Count AI agreements
+        ai_agreements = len([item for item in merged_results if item['source'] == 'both_ais'])
+        
+        # Log top results
+        print(f"\n🎯 Top 10 Results:")
+        for i, item in enumerate(merged_results[:10]):
+            sources_indicator = "🤖🤖" if item['source'] == 'both_ais' else ("🧠" if item['source'] == 'openai' else "👁️")
+            print(f"  {i+1}. {item['name']} ({item['confidence']}%) {sources_indicator}")
+        
+        return {
+            "items": [item["name"] for item in merged_results],
+            "food_items": merged_results,
             "high_confidence": high_confidence,
             "medium_confidence": medium_confidence,
             "low_confidence": low_confidence,
-            "total_food_detected": len(final_results),
-            "ai_enhanced": openai_result is not None,
-            "max_confidence": max_confidence,
-            "analysis_method": "ai_enhanced" if openai_result else "clarifai_only"
+            "total_food_detected": len(merged_results),
+            "ai_agreements": ai_agreements,
+            "agreement_percentage": round((ai_agreements / len(merged_results) * 100), 1) if merged_results else 0,
+            "clarifai_detected": len(clarifai_items),
+            "openai_detected": len(openai_items),
+            "raw_total": len(all_detected_items),
+            "duplicates_merged": len(all_detected_items) - len(merged_results),
+            "ai_enhanced": True,
+            "analysis_method": "dual_ai_enhanced"
         }
 
-        if openai_result and 'analysis' in openai_result:
-            response_data["ai_analysis"] = openai_result['analysis']
-
-        return response_data
-
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"❌ Error in detect_foods: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/suggest_meals")
 async def suggest_meals(ingredients: list):
-    """Placeholder for Spoonacular integration"""
+    """Enhanced meal suggestions using detected ingredients"""
     return {
-        "message": "Meal suggestions coming soon!",
-        "ingredients_received": ingredients,
-        "suggested_recipes": []
+        "message": "Spoonacular integration coming soon!",
+        "ingredients_received": len(ingredients),
+        "detected_ingredients": ingredients,
+        "suggested_recipes": [
+            {
+                "name": "Recipe suggestions will appear here",
+                "missing_ingredients": 0,
+                "ready_to_cook": True
+            }
+        ]
     }
 
 @app.get("/")
 async def root():
     ai_status = "enabled" if openai_client else "disabled"
     return {
-        "message": "MealMapper AI-Enhanced API is running",
-        "version": "3.0",
-        "ai_backup": ai_status
+        "message": "MealMapper Dual-AI Enhanced API",
+        "version": "4.0",
+        "ai_systems": {
+            "clarifai": "enabled",
+            "openai_vision": ai_status
+        },
+        "features": ["smart_duplicate_merging", "confidence_boosting", "ai_agreement_detection"]
     }
 
 @app.get("/health")
 async def health_check():
     return {
         "status": "healthy",
-        "clarifai_models": len(MODELS),
-        "ai_backup": openai_client is not None
+        "clarifai_models": len(CLARIFAI_MODELS),
+        "openai_available": openai_client is not None,
+        "ai_systems": 2 if openai_client else 1
+    }
+
+@app.get("/debug")
+async def debug_info():
+    """Debug endpoint to check AI system status"""
+    return {
+        "clarifai_key_set": CLARIFAI_API_KEY != "your_clarifai_key_here",
+        "openai_key_set": OPENAI_API_KEY != "your_openai_key_here",
+        "openai_client_ready": openai_client is not None,
+        "models_configured": len(CLARIFAI_MODELS)
     }
