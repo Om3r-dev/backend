@@ -7,6 +7,8 @@ from PIL import Image, ImageEnhance
 import io
 import json
 from openai import OpenAI
+import requests
+from typing import List, Dict, Optional
 
 app = FastAPI()
 
@@ -21,7 +23,7 @@ app.add_middleware(
 # API Keys - Set these as environment variables
 CLARIFAI_API_KEY = os.getenv("CLARIFAI_API_KEY", "your_clarifai_key_here")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "your_openai_key_here")
-
+SPOONACULAR_API_KEY = os.getenv("SPOONACULAR_API_KEY", "your_spoonacular_key_here")
 # Initialize OpenAI client
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY != "your_openai_key_here" else None
 
@@ -151,7 +153,7 @@ def query_openai_vision(image_base64):
         """
 
         response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",  # ✅ FIXED: Changed from "gpt-4-vision-preview"
+            model="gpt-4-vision-preview",
             messages=[
                 {
                     "role": "user",
@@ -385,4 +387,277 @@ async def debug_info():
         "openai_key_set": OPENAI_API_KEY != "your_openai_key_here",
         "openai_client_ready": openai_client is not None,
         "models_configured": len(CLARIFAI_MODELS)
+    }
+class SpoonacularClient:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://api.spoonacular.com"
+        self.headers = {"Content-Type": "application/json"}
+    
+    def find_recipes_by_ingredients(self, ingredients: List[str], number: int = 10) -> List[Dict]:
+        """Find recipes that can be made with the given ingredients"""
+        if not ingredients:
+            return []
+        
+        # Clean and format ingredients for Spoonacular
+        formatted_ingredients = [ingredient.strip().lower() for ingredient in ingredients]
+        ingredients_string = ",".join(formatted_ingredients)
+        
+        url = f"{self.base_url}/recipes/findByIngredients"
+        params = {
+            "apiKey": self.api_key,
+            "ingredients": ingredients_string,
+            "number": number,
+            "ranking": 2,  # Maximize used ingredients
+            "ignorePantry": False,  # Include common pantry items
+            "limitLicense": False
+        }
+        
+        try:
+            print(f"🍳 Searching Spoonacular with ingredients: {ingredients_string}")
+            response = requests.get(url, params=params, timeout=15)
+            
+            if response.status_code == 200:
+                recipes = response.json()
+                print(f"✅ Found {len(recipes)} recipes")
+                return recipes
+            else:
+                print(f"❌ Spoonacular API error: {response.status_code}")
+                return []
+                
+        except Exception as e:
+            print(f"❌ Spoonacular request failed: {e}")
+            return []
+    
+    def get_recipe_details(self, recipe_id: int) -> Optional[Dict]:
+        """Get detailed information about a specific recipe"""
+        url = f"{self.base_url}/recipes/{recipe_id}/information"
+        params = {
+            "apiKey": self.api_key,
+            "includeNutrition": False
+        }
+        
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except Exception as e:
+            print(f"❌ Failed to get recipe details for {recipe_id}: {e}")
+            return None
+    
+    def get_bulk_recipe_details(self, recipe_ids: List[int]) -> List[Dict]:
+        """Get details for multiple recipes in one call"""
+        if not recipe_ids:
+            return []
+        
+        ids_string = ",".join(str(id) for id in recipe_ids)
+        url = f"{self.base_url}/recipes/informationBulk"
+        params = {
+            "apiKey": self.api_key,
+            "ids": ids_string,
+            "includeNutrition": False
+        }
+        
+        try:
+            response = requests.get(url, params=params, timeout=15)
+            if response.status_code == 200:
+                return response.json()
+            return []
+        except Exception as e:
+            print(f"❌ Failed to get bulk recipe details: {e}")
+            return []
+
+# Initialize Spoonacular client
+spoonacular_client = SpoonacularClient(SPOONACULAR_API_KEY) if SPOONACULAR_API_KEY != "your_spoonacular_key_here" else None
+
+def process_spoonacular_recipes(raw_recipes: List[Dict], available_ingredients: List[str]) -> List[Dict]:
+    """Process and enhance Spoonacular recipe results"""
+    processed_recipes = []
+    
+    for recipe in raw_recipes:
+        # Calculate recipe metrics
+        used_ingredients = recipe.get('usedIngredients', [])
+        missed_ingredients = recipe.get('missedIngredients', [])
+        
+        used_count = len(used_ingredients)
+        missed_count = len(missed_ingredients)
+        total_ingredients = used_count + missed_count
+        
+        # Calculate match percentage
+        match_percentage = (used_count / total_ingredients * 100) if total_ingredients > 0 else 0
+        
+        # Determine if recipe is "ready to cook" (missing <= 2 ingredients)
+        ready_to_cook = missed_count <= 2
+        
+        # Extract ingredient names
+        used_ingredient_names = [ing['name'] for ing in used_ingredients]
+        missed_ingredient_names = [ing['name'] for ing in missed_ingredients]
+        
+        processed_recipe = {
+            "id": recipe.get('id'),
+            "name": recipe.get('title'),
+            "image": recipe.get('image'),
+            "used_ingredients": used_ingredient_names,
+            "missed_ingredients": missed_ingredient_names,
+            "used_ingredient_count": used_count,
+            "missed_ingredient_count": missed_count,
+            "match_percentage": round(match_percentage, 1),
+            "ready_to_cook": ready_to_cook,
+            "difficulty": "Easy" if missed_count <= 1 else "Medium" if missed_count <= 3 else "Hard",
+            "spoonacular_score": recipe.get('likes', 0)
+        }
+        
+        processed_recipes.append(processed_recipe)
+    
+    # Sort by match percentage, then by likes
+    processed_recipes.sort(key=lambda x: (x['match_percentage'], x['spoonacular_score']), reverse=True)
+    
+    return processed_recipes
+
+def get_recipe_suggestions(ingredients: List[str], max_recipes: int = 8) -> Dict:
+    """Get recipe suggestions based on available ingredients"""
+    if not spoonacular_client:
+        return {
+            "error": "Spoonacular API not configured",
+            "recipes": [],
+            "total_found": 0
+        }
+    
+    if not ingredients:
+        return {
+            "error": "No ingredients provided",
+            "recipes": [],
+            "total_found": 0
+        }
+    
+    # Filter ingredients to focus on food items (remove very generic terms)
+    filtered_ingredients = []
+    generic_terms = {'food', 'item', 'object', 'product', 'container', 'package'}
+    
+    for ingredient in ingredients:
+        if ingredient.lower().strip() not in generic_terms and len(ingredient.strip()) > 2:
+            filtered_ingredients.append(ingredient.strip())
+    
+    print(f"🔍 Filtered ingredients for recipe search: {filtered_ingredients}")
+    
+    # Get recipes from Spoonacular
+    raw_recipes = spoonacular_client.find_recipes_by_ingredients(
+        filtered_ingredients, 
+        number=max_recipes * 2  # Get more to have better filtering options
+    )
+    
+    if not raw_recipes:
+        return {
+            "message": "No recipes found with current ingredients",
+            "recipes": [],
+            "total_found": 0,
+            "ingredients_used": filtered_ingredients
+        }
+    
+    # Process and rank recipes
+    processed_recipes = process_spoonacular_recipes(raw_recipes, filtered_ingredients)
+    
+    # Limit to requested number
+    final_recipes = processed_recipes[:max_recipes]
+    
+    # Calculate summary statistics
+    ready_to_cook_count = len([r for r in final_recipes if r['ready_to_cook']])
+    avg_match_percentage = sum(r['match_percentage'] for r in final_recipes) / len(final_recipes) if final_recipes else 0
+    
+    return {
+        "recipes": final_recipes,
+        "total_found": len(raw_recipes),
+        "recipes_returned": len(final_recipes),
+        "ready_to_cook_count": ready_to_cook_count,
+        "average_match_percentage": round(avg_match_percentage, 1),
+        "ingredients_used": filtered_ingredients,
+        "api_source": "spoonacular"
+    }
+
+# Replace your existing suggest_meals endpoint with this enhanced version:
+@app.post("/suggest_meals")
+async def suggest_meals(request_data: dict):
+    """Enhanced meal suggestions using Spoonacular API"""
+    try:
+        # Extract ingredients from request
+        ingredients = request_data.get("ingredients", [])
+        if isinstance(ingredients, str):
+            ingredients = [ingredients]
+        
+        max_recipes = request_data.get("max_recipes", 8)
+        
+        print(f"\n🍽️ Generating meal suggestions for {len(ingredients)} ingredients")
+        
+        # Get recipe suggestions
+        suggestions = get_recipe_suggestions(ingredients, max_recipes)
+        
+        # Add metadata
+        suggestions["timestamp"] = "2025-08-19T" + str(len(ingredients))  # Simple timestamp
+        suggestions["service_status"] = "active" if spoonacular_client else "limited"
+        
+        return suggestions
+        
+    except Exception as e:
+        print(f"❌ Error in suggest_meals: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Recipe suggestion failed: {str(e)}")
+
+# Add this helper endpoint to get detailed recipe information
+@app.get("/recipe/{recipe_id}")
+async def get_recipe_details_endpoint(recipe_id: int):
+    """Get detailed information about a specific recipe"""
+    if not spoonacular_client:
+        raise HTTPException(status_code=503, detail="Spoonacular API not configured")
+    
+    try:
+        recipe_details = spoonacular_client.get_recipe_details(recipe_id)
+        
+        if not recipe_details:
+            raise HTTPException(status_code=404, detail="Recipe not found")
+        
+        # Extract key information
+        processed_details = {
+            "id": recipe_details.get("id"),
+            "title": recipe_details.get("title"),
+            "image": recipe_details.get("image"),
+            "ready_in_minutes": recipe_details.get("readyInMinutes"),
+            "servings": recipe_details.get("servings"),
+            "source_url": recipe_details.get("sourceUrl"),
+            "spoonacular_url": recipe_details.get("spoonacularSourceUrl"),
+            "instructions": recipe_details.get("instructions", ""),
+            "summary": recipe_details.get("summary", ""),
+            "ingredients": [
+                {
+                    "name": ing.get("name"),
+                    "amount": ing.get("amount"),
+                    "unit": ing.get("unit")
+                }
+                for ing in recipe_details.get("extendedIngredients", [])
+            ]
+        }
+        
+        return processed_details
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error getting recipe details: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch recipe details")
+
+# Update your debug endpoint to include Spoonacular status
+@app.get("/debug")
+async def debug_info():
+    """Debug endpoint to check all AI system status"""
+    return {
+        "clarifai_key_set": CLARIFAI_API_KEY != "your_clarifai_key_here",
+        "openai_key_set": OPENAI_API_KEY != "your_openai_key_here",
+        "spoonacular_key_set": SPOONACULAR_API_KEY != "your_spoonacular_key_here",
+        "openai_client_ready": openai_client is not None,
+        "spoonacular_client_ready": spoonacular_client is not None,
+        "models_configured": len(CLARIFAI_MODELS),
+        "all_services_ready": all([
+            CLARIFAI_API_KEY != "your_clarifai_key_here",
+            openai_client is not None,
+            spoonacular_client is not None
+        ])
     }
