@@ -9,6 +9,7 @@ import json
 from openai import OpenAI
 import requests
 from typing import List, Dict, Optional
+import re
 
 app = FastAPI()
 
@@ -24,8 +25,9 @@ app.add_middleware(
 CLARIFAI_API_KEY = os.getenv("CLARIFAI_API_KEY", "api_key_here")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "api_key_here")
 SPOONACULAR_API_KEY = os.getenv("SPOONACULAR_API_KEY", "api_key_here")
-# Initialize OpenAI client
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY != "api_key_here" else None
+
+# Initialize OpenAI client - FIXED
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY and OPENAI_API_KEY != "api_key_here" else None
 
 USER_ID = "clarifai"
 APP_ID = "main"
@@ -118,42 +120,57 @@ def query_clarifai_models(image_base64):
     return clarifai_results
 
 def query_openai_vision(image_base64):
-    """Use OpenAI Vision for comprehensive food detection"""
+    """Use OpenAI Vision for comprehensive food detection - ENHANCED VERSION"""
     if not openai_client:
         print("❌ OpenAI client not available")
+        print(f"   - API key set: {bool(OPENAI_API_KEY)}")
+        print(f"   - API key value: {OPENAI_API_KEY[:20] if OPENAI_API_KEY else 'None'}...")
         return []
     
     try:
         print("🧠 Querying OpenAI Vision...")
+        print(f"   - Using model: gpt-4o")
+        print(f"   - Image size: {len(image_base64)} characters")
         
+        # Improved prompt with more explicit instructions
         prompt = """
-        Analyze this refrigerator/kitchen image and identify ALL food ingredients that could be used for cooking.
-        
-        Focus on detecting:
-        - Fresh produce (fruits, vegetables, herbs)
-        - Dairy products (milk, cheese, eggs, yogurt, butter)
-        - Meat and proteins (chicken, beef, fish, tofu)
-        - Pantry items (bread, pasta, rice, sauces)
-        - Beverages (juice, milk, water)
-        - Condiments and seasonings
-        - Leftovers and prepared foods
-        - Canned/packaged goods
-        
-        Be very thorough and specific. Look carefully at containers, packages, and fresh items.
-        Consider items that might be partially visible or in the background.
-        
-        Return ONLY a JSON array of objects with this exact format:
+        You are an expert food identification AI. Analyze this refrigerator/kitchen image with extreme care and attention to detail.
+
+        IMPORTANT INSTRUCTIONS:
+        1. Look at EVERY visible item, container, package, bottle, jar, and food product
+        2. Read any visible text/labels on packages and containers
+        3. Identify fresh produce, dairy, meats, beverages, condiments, leftovers
+        4. Include items that are partially visible or in the background
+        5. Be specific with names (e.g., "2% milk" not "dairy", "cheddar cheese" not "cheese")
+
+        WHAT TO LOOK FOR:
+        - Milk cartons, juice boxes, water bottles
+        - Egg cartons, cheese packages, yogurt containers
+        - Fresh fruits and vegetables in drawers/shelves
+        - Meat packages, deli containers
+        - Condiment bottles (ketchup, mustard, sauces)
+        - Leftover containers, takeout boxes
+        - Bread, tortillas, baked goods
+        - Canned goods, jars, packages
+
+        RESPONSE FORMAT:
+        Return ONLY a valid JSON array. No other text or explanations.
+        Format: [{"name": "specific_item_name", "confidence": 85}]
+
+        Examples:
         [
-            {"name": "milk", "confidence": 95},
-            {"name": "eggs", "confidence": 90},
-            {"name": "carrots", "confidence": 85}
+            {"name": "whole milk", "confidence": 95},
+            {"name": "large eggs", "confidence": 90},
+            {"name": "cheddar cheese slices", "confidence": 88},
+            {"name": "fresh broccoli", "confidence": 85},
+            {"name": "ground beef", "confidence": 80}
         ]
-        
-        Include confidence scores from 60-99 based on how clearly visible and certain each item is.
+
+        Be thorough and look carefully at every part of the image.
         """
 
         response = openai_client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model="gpt-4o",  # Changed to gpt-4o for better vision
             messages=[
                 {
                     "role": "user",
@@ -169,43 +186,91 @@ def query_openai_vision(image_base64):
                     ]
                 }
             ],
-            max_tokens=1500,
-            temperature=0.2
+            max_tokens=2000,  # Increased for more detailed responses
+            temperature=0.1,   # Lower temperature for more consistent results
         )
         
         content = response.choices[0].message.content.strip()
-        print(f"🧠 OpenAI raw response: {content[:200]}...")
         
-        # Parse JSON response
+        # More detailed logging
+        print(f"🧠 OpenAI full response length: {len(content)} characters")
+        print(f"🧠 OpenAI response preview: {content[:300]}...")
+        
+        # Better JSON parsing with multiple attempts
         try:
-            # Try to find JSON array in the response
-            import re
-            json_match = re.search(r'\[.*\]', content, re.DOTALL)
-            if json_match:
-                json_str = json_match.group()
-                items = json.loads(json_str)
+            # Method 1: Try direct JSON parsing
+            try:
+                items = json.loads(content)
+                if isinstance(items, list):
+                    print("✅ Direct JSON parsing successful")
+                else:
+                    raise ValueError("Not a list")
+            except:
+                # Method 2: Extract JSON array with regex
+                json_patterns = [
+                    r'\[[\s\S]*\]',  # Standard array
+                    r'```json\s*(\[[\s\S]*?\])\s*```',  # Code block
+                    r'```\s*(\[[\s\S]*?\])\s*```',  # Simple code block
+                ]
                 
-                openai_results = []
-                for item in items:
-                    if isinstance(item, dict) and 'name' in item:
-                        openai_results.append({
-                            'name': item['name'],
-                            'confidence': item.get('confidence', 80),
-                            'source': 'openai'
-                        })
+                items = None
+                for pattern in json_patterns:
+                    match = re.search(pattern, content, re.DOTALL)
+                    if match:
+                        json_str = match.group(1) if match.groups() else match.group(0)
+                        try:
+                            items = json.loads(json_str)
+                            print(f"✅ Regex JSON parsing successful with pattern: {pattern}")
+                            break
+                        except:
+                            continue
                 
-                print(f"✅ OpenAI detected {len(openai_results)} items")
-                return openai_results
+                if items is None:
+                    print("❌ All JSON parsing methods failed")
+                    print(f"Raw response: {content}")
+                    return []
+            
+            # Process the items
+            openai_results = []
+            for item in items:
+                if isinstance(item, dict) and 'name' in item:
+                    confidence = item.get('confidence', 75)
+                    # Ensure confidence is reasonable
+                    if confidence < 60:
+                        confidence = 60
+                    elif confidence > 99:
+                        confidence = 99
+                        
+                    openai_results.append({
+                        'name': item['name'],
+                        'confidence': confidence,
+                        'source': 'openai'
+                    })
+                else:
+                    print(f"⚠️ Skipping invalid item: {item}")
+            
+            print(f"✅ OpenAI detected {len(openai_results)} valid items")
+            
+            # Log the detected items for debugging
+            if openai_results:
+                print("🧠 OpenAI detected items:")
+                for i, item in enumerate(openai_results[:5]):  # Show first 5
+                    print(f"   {i+1}. {item['name']} ({item['confidence']}%)")
+                if len(openai_results) > 5:
+                    print(f"   ... and {len(openai_results) - 5} more items")
             else:
-                print("❌ Could not parse OpenAI JSON response")
-                return []
+                print("🧠 No items detected by OpenAI")
+            
+            return openai_results
                 
         except json.JSONDecodeError as e:
             print(f"❌ OpenAI JSON parse error: {e}")
+            print(f"Raw content: {content}")
             return []
         
     except Exception as e:
         print(f"❌ OpenAI Vision error: {e}")
+        print(f"Error type: {type(e).__name__}")
         return []
 
 def merge_duplicate_items(all_items):
@@ -241,6 +306,10 @@ def merge_duplicate_items(all_items):
         
         if normalized_name in merged:
             existing = merged[normalized_name]
+            
+            # Initialize sources if not exists
+            if 'sources' not in existing:
+                existing['sources'] = [existing['source']]
             
             # Boost confidence when multiple AIs detect the same item
             if item['source'] != existing['source']:
@@ -341,53 +410,6 @@ async def detect_foods(file: UploadFile = File(...)):
         print(f"❌ Error in detect_foods: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/suggest_meals")
-async def suggest_meals(ingredients: list):
-    """Enhanced meal suggestions using detected ingredients"""
-    return {
-        "message": "Spoonacular integration coming soon!",
-        "ingredients_received": len(ingredients),
-        "detected_ingredients": ingredients,
-        "suggested_recipes": [
-            {
-                "name": "Recipe suggestions will appear here",
-                "missing_ingredients": 0,
-                "ready_to_cook": True
-            }
-        ]
-    }
-
-@app.get("/")
-async def root():
-    ai_status = "enabled" if openai_client else "disabled"
-    return {
-        "message": "MealMapper Dual-AI Enhanced API",
-        "version": "4.0",
-        "ai_systems": {
-            "clarifai": "enabled",
-            "openai_vision": ai_status
-        },
-        "features": ["smart_duplicate_merging", "confidence_boosting", "ai_agreement_detection"]
-    }
-
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "clarifai_models": len(CLARIFAI_MODELS),
-        "openai_available": openai_client is not None,
-        "ai_systems": 2 if openai_client else 1
-    }
-
-@app.get("/debug")
-async def debug_info():
-    """Debug endpoint to check AI system status"""
-    return {
-        "clarifai_key_set": CLARIFAI_API_KEY != "your_clarifai_key_here",
-        "openai_key_set": OPENAI_API_KEY != "your_openai_key_here",
-        "openai_client_ready": openai_client is not None,
-        "models_configured": len(CLARIFAI_MODELS)
-    }
 class SpoonacularClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -468,8 +490,8 @@ class SpoonacularClient:
             print(f"❌ Failed to get bulk recipe details: {e}")
             return []
 
-# Initialize Spoonacular client
-spoonacular_client = SpoonacularClient(SPOONACULAR_API_KEY) if SPOONACULAR_API_KEY != "your_spoonacular_key_here" else None
+# Initialize Spoonacular client - FIXED
+spoonacular_client = SpoonacularClient(SPOONACULAR_API_KEY) if SPOONACULAR_API_KEY and SPOONACULAR_API_KEY != "api_key_here" else None
 
 def process_spoonacular_recipes(raw_recipes: List[Dict], available_ingredients: List[str]) -> List[Dict]:
     """Process and enhance Spoonacular recipe results"""
@@ -575,7 +597,6 @@ def get_recipe_suggestions(ingredients: List[str], max_recipes: int = 8) -> Dict
         "api_source": "spoonacular"
     }
 
-# Replace your existing suggest_meals endpoint with this enhanced version:
 @app.post("/suggest_meals")
 async def suggest_meals(request_data: dict):
     """Enhanced meal suggestions using Spoonacular API"""
@@ -602,7 +623,6 @@ async def suggest_meals(request_data: dict):
         print(f"❌ Error in suggest_meals: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Recipe suggestion failed: {str(e)}")
 
-# Add this helper endpoint to get detailed recipe information
 @app.get("/recipe/{recipe_id}")
 async def get_recipe_details_endpoint(recipe_id: int):
     """Get detailed information about a specific recipe"""
@@ -644,19 +664,40 @@ async def get_recipe_details_endpoint(recipe_id: int):
         print(f"❌ Error getting recipe details: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch recipe details")
 
-# Update your debug endpoint to include Spoonacular status
+@app.get("/")
+async def root():
+    ai_status = "enabled" if openai_client else "disabled"
+    return {
+        "message": "MealMapper Dual-AI Enhanced API",
+        "version": "4.0",
+        "ai_systems": {
+            "clarifai": "enabled",
+            "openai_vision": ai_status
+        },
+        "features": ["smart_duplicate_merging", "confidence_boosting", "ai_agreement_detection"]
+    }
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "clarifai_models": len(CLARIFAI_MODELS),
+        "openai_available": openai_client is not None,
+        "ai_systems": 2 if openai_client else 1
+    }
+
 @app.get("/debug")
 async def debug_info():
-    """Debug endpoint to check all AI system status"""
+    """Debug endpoint to check all AI system status - FIXED"""
     return {
-        "clarifai_key_set": CLARIFAI_API_KEY != "your_clarifai_key_here",
-        "openai_key_set": OPENAI_API_KEY != "your_openai_key_here",
-        "spoonacular_key_set": SPOONACULAR_API_KEY != "your_spoonacular_key_here",
+        "clarifai_key_set": CLARIFAI_API_KEY != "api_key_here",
+        "openai_key_set": OPENAI_API_KEY != "api_key_here",  # FIXED
+        "spoonacular_key_set": SPOONACULAR_API_KEY != "api_key_here",  # FIXED
         "openai_client_ready": openai_client is not None,
         "spoonacular_client_ready": spoonacular_client is not None,
         "models_configured": len(CLARIFAI_MODELS),
         "all_services_ready": all([
-            CLARIFAI_API_KEY != "your_clarifai_key_here",
+            CLARIFAI_API_KEY != "api_key_here",
             openai_client is not None,
             spoonacular_client is not None
         ])
