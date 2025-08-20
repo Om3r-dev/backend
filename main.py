@@ -153,7 +153,7 @@ def query_openai_vision(image_base64):
         """
 
         response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4.1-mini",
             messages=[
                 {
                     "role": "user",
