@@ -21,11 +21,11 @@ app.add_middleware(
 )
 
 # API Keys - Set these as environment variables
-CLARIFAI_API_KEY = os.getenv("CLARIFAI_API_KEY", "7a918c1528ad460694d606386c472a63")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")
-SPOONACULAR_API_KEY = os.getenv("SPOONACULAR_API_KEY", "25dfe76c6209249cbc5ebfd8f04fd25b8c742c7d")
+CLARIFAI_API_KEY = os.getenv("CLARIFAI_API_KEY", "api_key_here")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "api_key_here")
+SPOONACULAR_API_KEY = os.getenv("SPOONACULAR_API_KEY", "api_key_here")
 # Initialize OpenAI client
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY != "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" else None
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY != "api_key_here" else None
 
 USER_ID = "clarifai"
 APP_ID = "main"
