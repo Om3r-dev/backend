@@ -1,704 +1,569 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import requests
-import base64
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import os
-from PIL import Image, ImageEnhance
+import base64
+import requests
+import google.generativeai as genai
+from PIL import Image
 import io
 import json
-from openai import OpenAI
-import requests
-from typing import List, Dict, Optional
+from typing import List, Dict, Set
 import re
+from collections import Counter
+import logging
 
-app = FastAPI()
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = Flask(__name__)
+CORS(app)
 
-# API Keys - Set these as environment variables
-CLARIFAI_API_KEY = os.getenv("CLARIFAI_API_KEY", "api_key_here")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "api_key_here")
-SPOONACULAR_API_KEY = os.getenv("SPOONACULAR_API_KEY", "api_key_here")
+# Configure APIs
+genai.configure(api_key=os.getenv('GOOGLE_GEMINI_API_KEY'))
+CLARIFAI_API_KEY = os.getenv('CLARIFAI_API_KEY')
+SPOONACULAR_API_KEY = os.getenv('SPOONACULAR_API_KEY')
 
-# Initialize OpenAI client - FIXED
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY and OPENAI_API_KEY != "api_key_here" else None
-
-USER_ID = "clarifai"
-APP_ID = "main"
-
-# Multiple Clarifai models
-CLARIFAI_MODELS = [
-    {"id": "food-item-recognition", "weight": 1.0},
-    {"id": "general", "weight": 0.8},
-]
-
-def preprocess_image(image_bytes):
-    """Enhance image for better recognition"""
-    try:
-        img = Image.open(io.BytesIO(image_bytes))
-        
-        if img.mode != 'RGB':
-            img = img.convert('RGB')
-        
-        # More aggressive enhancement for better AI detection
-        enhancer = ImageEnhance.Brightness(img)
-        img = enhancer.enhance(1.3)
-        
-        enhancer = ImageEnhance.Contrast(img)
-        img = enhancer.enhance(1.2)
-        
-        enhancer = ImageEnhance.Sharpness(img)
-        img = enhancer.enhance(1.1)
-        
-        # Convert back to bytes
-        output_buffer = io.BytesIO()
-        img.save(output_buffer, format='JPEG', quality=95)
-        enhanced_bytes = output_buffer.getvalue()
-        
-        return enhanced_bytes
-    except Exception as e:
-        print(f"Image preprocessing failed: {e}")
-        return image_bytes
-
-def query_clarifai_models(image_base64):
-    """Query all Clarifai models simultaneously"""
-    clarifai_results = []
-    
-    headers = {
-        "Authorization": f"Key {CLARIFAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    for model_info in CLARIFAI_MODELS:
-        model_id = model_info["id"]
-        weight = model_info["weight"]
-        
-        url = f"https://api.clarifai.com/v2/users/{USER_ID}/apps/{APP_ID}/models/{model_id}/outputs"
-        
-        payload = {
-            "inputs": [
-                {
-                    "data": {
-                        "image": {
-                            "base64": image_base64
-                        }
-                    }
-                }
-            ]
+class FoodDetectionService:
+    def __init__(self):
+        self.gemini_model = genai.GenerativeModel('gemini-pro-vision')
+        self.food_keywords = {
+            'vegetables': ['carrot', 'broccoli', 'spinach', 'lettuce', 'tomato', 'cucumber', 
+                          'bell pepper', 'red pepper', 'green pepper', 'yellow pepper', 'onion', 
+                          'red onion', 'white onion', 'garlic', 'potato', 'sweet potato', 'celery',
+                          'cabbage', 'cauliflower', 'zucchini', 'eggplant', 'mushroom', 'corn',
+                          'peas', 'green beans', 'asparagus', 'radish', 'beets', 'kale', 'arugula',
+                          'cilantro', 'parsley', 'green onion', 'scallion', 'jalapeño', 'chili'],
+            'fruits': ['apple', 'green apple', 'red apple', 'banana', 'orange', 'lemon', 'lime', 
+                      'strawberry', 'blueberry', 'grape', 'pear', 'peach', 'plum', 'cherry', 
+                      'pineapple', 'mango', 'avocado', 'kiwi', 'melon', 'watermelon', 'pomegranate'],
+            'proteins': ['chicken', 'chicken breast', 'chicken thigh', 'beef', 'ground beef', 
+                        'pork', 'fish', 'salmon', 'tuna', 'shrimp', 'eggs', 'tofu', 'black beans',
+                        'kidney beans', 'lentils', 'chickpeas', 'turkey', 'lamb', 'bacon', 'ham'],
+            'dairy': ['milk', 'whole milk', 'skim milk', 'cheese', 'cheddar cheese', 'mozzarella',
+                     'yogurt', 'greek yogurt', 'butter', 'cream', 'sour cream', 'cottage cheese',
+                     'parmesan', 'feta', 'goat cheese', 'cream cheese'],
+            'grains': ['rice', 'brown rice', 'white rice', 'pasta', 'bread', 'white bread',
+                      'whole wheat bread', 'quinoa', 'oats', 'barley', 'flour', 'noodles'],
+            'pantry': ['olive oil', 'vegetable oil', 'vinegar', 'balsamic vinegar', 'salt',
+                      'pepper', 'sugar', 'honey', 'garlic powder', 'onion powder', 'paprika']
         }
 
+    def detect_with_gemini(self, image_data: bytes) -> List[Dict]:
+        """Use Google Gemini Pro Vision to detect food items"""
         try:
-            print(f"🔍 Querying Clarifai model: {model_id}")
+            image = Image.open(io.BytesIO(image_data))
+            
+            prompt = """
+            Analyze this food/fridge image and identify EVERY SINGLE SPECIFIC ingredient you can see.
+            
+            CRITICAL RULES:
+            - List each ingredient individually (tomato, onion, carrot) - NOT categories like "vegetables"
+            - Be as specific as possible: "red bell pepper" not just "pepper", "cheddar cheese" not just "cheese"
+            - Include ALL visible ingredients: fruits, vegetables, meats, dairy, spices, condiments, pantry items
+            - For packaged items, identify the food inside: "ground beef" not "package"
+            - List fresh herbs specifically: basil, cilantro, parsley, etc.
+            
+            Return ONLY a JSON array like this:
+            [{"name": "tomato", "confidence": 85}, {"name": "red onion", "confidence": 90}, {"name": "cheddar cheese", "confidence": 75}]
+            
+            Focus on ingredients that could be used for cooking. Be thorough and specific.
+            """
+            
+            response = self.gemini_model.generate_content([prompt, image])
+            
+            if response.text:
+                # Try to extract JSON array from response
+                json_match = re.search(r'\[(.*?)\]', response.text.replace('\n', ''), re.DOTALL)
+                if json_match:
+                    try:
+                        items = json.loads('[' + json_match.group(1) + ']')
+                        return [{'name': item['name'].lower().strip(), 
+                               'confidence': min(item['confidence'], 95), 
+                               'source': 'gemini'} for item in items if item.get('name')]
+                    except json.JSONDecodeError:
+                        pass
+                
+                # Fallback: extract ingredients from text
+                items = []
+                text_lines = response.text.lower().split('\n')
+                for line in text_lines:
+                    # Look for ingredient patterns
+                    if any(word in line for word in ['ingredient', 'food', 'item', '-', '•', '1.', '2.']):
+                        # Extract ingredient names
+                        words = re.findall(r'\b[a-zA-Z\s]{3,20}\b', line)
+                        for word in words:
+                            clean_word = word.strip()
+                            if (len(clean_word) > 2 and 
+                                clean_word not in ['ingredient', 'food', 'item', 'the', 'and', 'with'] and
+                                any(keyword in clean_word for category in self.food_keywords.values() for keyword in category)):
+                                items.append({
+                                    'name': clean_word,
+                                    'confidence': 80,
+                                    'source': 'gemini'
+                                })
+                
+                return items[:25]
+                
+        except Exception as e:
+            logger.error(f"Gemini detection error: {e}")
+            return []
+
+    def detect_with_clarifai(self, image_data: bytes) -> List[Dict]:
+        """Use Clarifai Food Model to detect food items"""
+        try:
+            image_b64 = base64.b64encode(image_data).decode('utf-8')
+            
+            url = "https://api.clarifai.com/v2/models/food-item-recognition/outputs"
+            headers = {
+                "Authorization": f"Key {CLARIFAI_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            
+            payload = {
+                "inputs": [{
+                    "data": {
+                        "image": {
+                            "base64": image_b64
+                        }
+                    }
+                }]
+            }
+            
             response = requests.post(url, json=payload, headers=headers, timeout=30)
             
             if response.status_code == 200:
-                result = response.json()
-                outputs = result.get('outputs', [])
-                if outputs:
-                    concepts = outputs[0].get('data', {}).get('concepts', [])
-                    for concept in concepts:
-                        if concept['value'] > 0.15:  # Filter low confidence
-                            clarifai_results.append({
-                                'name': concept['name'],
-                                'confidence': round(concept['value'] * 100 * weight, 1),
-                                'source': 'clarifai',
-                                'model': model_id
+                data = response.json()
+                items = []
+                
+                if data.get('outputs') and data['outputs'][0].get('data', {}).get('concepts'):
+                    for concept in data['outputs'][0]['data']['concepts']:
+                        name = concept.get('name', '').lower().strip()
+                        confidence = concept.get('value', 0) * 100
+                        
+                        if name and confidence > 20 and name not in ['food', 'meal', 'dish']:
+                            items.append({
+                                'name': name,
+                                'confidence': min(int(confidence), 95),
+                                'source': 'clarifai'
                             })
-                print(f"✅ {model_id} returned {len(concepts)} concepts")
-            else:
-                print(f"❌ {model_id} failed: {response.status_code}")
+                
+                return items[:20]
                 
         except Exception as e:
-            print(f"❌ {model_id} error: {e}")
-    
-    return clarifai_results
-
-def query_openai_vision(image_base64):
-    """Use OpenAI Vision for comprehensive food detection - ENHANCED VERSION"""
-    if not openai_client:
-        print("❌ OpenAI client not available")
-        print(f"   - API key set: {bool(OPENAI_API_KEY)}")
-        print(f"   - API key value: {OPENAI_API_KEY[:20] if OPENAI_API_KEY else 'None'}...")
-        return []
-    
-    try:
-        print("🧠 Querying OpenAI Vision...")
-        print(f"   - Using model: gpt-4o")
-        print(f"   - Image size: {len(image_base64)} characters")
-        
-        # Improved prompt with more explicit instructions
-        prompt = """
-        You are an expert food identification AI. Analyze this refrigerator/kitchen image with extreme care and attention to detail.
-
-        IMPORTANT INSTRUCTIONS:
-        1. Look at EVERY visible item, container, package, bottle, jar, and food product
-        2. Read any visible text/labels on packages and containers
-        3. Identify fresh produce, dairy, meats, beverages, condiments, leftovers
-        4. Include items that are partially visible or in the background
-        5. Be specific with names (e.g., "2% milk" not "dairy", "cheddar cheese" not "cheese")
-
-        WHAT TO LOOK FOR:
-        - Milk cartons, juice boxes, water bottles
-        - Egg cartons, cheese packages, yogurt containers
-        - Fresh fruits and vegetables in drawers/shelves
-        - Meat packages, deli containers
-        - Condiment bottles (ketchup, mustard, sauces)
-        - Leftover containers, takeout boxes
-        - Bread, tortillas, baked goods
-        - Canned goods, jars, packages
-
-        RESPONSE FORMAT:
-        Return ONLY a valid JSON array. No other text or explanations.
-        Format: [{"name": "specific_item_name", "confidence": 85}]
-
-        Examples:
-        [
-            {"name": "whole milk", "confidence": 95},
-            {"name": "large eggs", "confidence": 90},
-            {"name": "cheddar cheese slices", "confidence": 88},
-            {"name": "fresh broccoli", "confidence": 85},
-            {"name": "ground beef", "confidence": 80}
-        ]
-
-        Be thorough and look carefully at every part of the image.
-        """
-
-        response = openai_client.chat.completions.create(
-            model="gpt-4o",  # Changed to gpt-4o for better vision
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_base64}",
-                                "detail": "high"
-                            }
-                        }
-                    ]
-                }
-            ],
-            max_tokens=2000,  # Increased for more detailed responses
-            temperature=0.1,   # Lower temperature for more consistent results
-        )
-        
-        content = response.choices[0].message.content.strip()
-        
-        # More detailed logging
-        print(f"🧠 OpenAI full response length: {len(content)} characters")
-        print(f"🧠 OpenAI response preview: {content[:300]}...")
-        
-        # Better JSON parsing with multiple attempts
-        try:
-            # Method 1: Try direct JSON parsing
-            try:
-                items = json.loads(content)
-                if isinstance(items, list):
-                    print("✅ Direct JSON parsing successful")
-                else:
-                    raise ValueError("Not a list")
-            except:
-                # Method 2: Extract JSON array with regex
-                json_patterns = [
-                    r'\[[\s\S]*\]',  # Standard array
-                    r'```json\s*(\[[\s\S]*?\])\s*```',  # Code block
-                    r'```\s*(\[[\s\S]*?\])\s*```',  # Simple code block
-                ]
-                
-                items = None
-                for pattern in json_patterns:
-                    match = re.search(pattern, content, re.DOTALL)
-                    if match:
-                        json_str = match.group(1) if match.groups() else match.group(0)
-                        try:
-                            items = json.loads(json_str)
-                            print(f"✅ Regex JSON parsing successful with pattern: {pattern}")
-                            break
-                        except:
-                            continue
-                
-                if items is None:
-                    print("❌ All JSON parsing methods failed")
-                    print(f"Raw response: {content}")
-                    return []
-            
-            # Process the items
-            openai_results = []
-            for item in items:
-                if isinstance(item, dict) and 'name' in item:
-                    confidence = item.get('confidence', 75)
-                    # Ensure confidence is reasonable
-                    if confidence < 60:
-                        confidence = 60
-                    elif confidence > 99:
-                        confidence = 99
-                        
-                    openai_results.append({
-                        'name': item['name'],
-                        'confidence': confidence,
-                        'source': 'openai'
-                    })
-                else:
-                    print(f"⚠️ Skipping invalid item: {item}")
-            
-            print(f"✅ OpenAI detected {len(openai_results)} valid items")
-            
-            # Log the detected items for debugging
-            if openai_results:
-                print("🧠 OpenAI detected items:")
-                for i, item in enumerate(openai_results[:5]):  # Show first 5
-                    print(f"   {i+1}. {item['name']} ({item['confidence']}%)")
-                if len(openai_results) > 5:
-                    print(f"   ... and {len(openai_results) - 5} more items")
-            else:
-                print("🧠 No items detected by OpenAI")
-            
-            return openai_results
-                
-        except json.JSONDecodeError as e:
-            print(f"❌ OpenAI JSON parse error: {e}")
-            print(f"Raw content: {content}")
+            logger.error(f"Clarifai detection error: {e}")
             return []
-        
-    except Exception as e:
-        print(f"❌ OpenAI Vision error: {e}")
-        print(f"Error type: {type(e).__name__}")
-        return []
 
-def merge_duplicate_items(all_items):
-    """Smart merging of duplicate items from different AI sources"""
-    merged = {}
-    
-    for item in all_items:
-        name = item['name'].lower().strip()
-        
-        # Handle common variations and synonyms
-        name_variations = {
-            'egg': 'eggs',
-            'carrot': 'carrots',
-            'tomato': 'tomatoes',
-            'potato': 'potatoes',
-            'onion': 'onions',
-            'bell pepper': 'pepper',
-            'red pepper': 'pepper',
-            'green pepper': 'pepper',
-            'whole milk': 'milk',
-            '2% milk': 'milk',
-            'skim milk': 'milk',
-            'cheddar cheese': 'cheese',
-            'mozzarella cheese': 'cheese',
-            'chicken breast': 'chicken',
-            'ground beef': 'beef',
-            'white bread': 'bread',
-            'wheat bread': 'bread',
-        }
-        
-        # Normalize name
-        normalized_name = name_variations.get(name, name)
-        
-        if normalized_name in merged:
-            existing = merged[normalized_name]
+    def detect_with_blip(self, image_data: bytes) -> List[Dict]:
+        """Use Hugging Face BLIP-2 to detect food items"""
+        try:
+            image_b64 = base64.b64encode(image_data).decode('utf-8')
             
-            # Initialize sources if not exists
-            if 'sources' not in existing:
-                existing['sources'] = [existing['source']]
+            # Use Hugging Face Inference API for BLIP-2
+            url = "https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-large"
+            headers = {"Authorization": "Bearer hf_demo"}  # Demo token - free tier
             
-            # Boost confidence when multiple AIs detect the same item
-            if item['source'] != existing['source']:
-                # Different sources agree - high confidence boost
-                confidence_boost = 1.4
-                existing['sources'].append(item['source'])
-                existing['source'] = 'both_ais'
-            else:
-                # Same source, multiple models - moderate boost
-                confidence_boost = 1.2
-            
-            # Take the higher confidence and boost it
-            new_confidence = max(existing['confidence'], item['confidence']) * confidence_boost
-            existing['confidence'] = min(99, round(new_confidence, 1))
-            
-            # Use the more descriptive name
-            if len(item['name']) > len(existing['name']):
-                existing['name'] = item['name']
-                
-        else:
-            merged[normalized_name] = {
-                'name': item['name'],
-                'confidence': item['confidence'],
-                'source': item['source'],
-                'sources': [item['source']],
-                'normalized_key': normalized_name
+            payload = {
+                "inputs": image_b64,
+                "parameters": {
+                    "max_length": 200,
+                    "do_sample": True
+                }
             }
-    
-    # Convert back to list and sort by confidence
-    final_results = list(merged.values())
-    final_results.sort(key=lambda x: x['confidence'], reverse=True)
-    
-    return final_results
+            
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                items = []
+                
+                if isinstance(data, list) and len(data) > 0:
+                    description = data[0].get('generated_text', '').lower()
+                    
+                    # Extract food ingredients from the description
+                    food_words = []
+                    for category, keywords in self.food_keywords.items():
+                        for keyword in keywords:
+                            if keyword in description:
+                                # Check if it's not already added
+                                if keyword not in [item['name'] for item in items]:
+                                    confidence = 70
+                                    # Boost confidence if multiple matches
+                                    if description.count(keyword) > 1:
+                                        confidence = min(confidence + 10, 90)
+                                    
+                                    items.append({
+                                        'name': keyword,
+                                        'confidence': confidence,
+                                        'source': 'blip'
+                                    })
+                
+                return items[:15]
+                
+        except Exception as e:
+            logger.error(f"BLIP detection error: {e}")
+            return []
 
-@app.post("/detect_foods")
-async def detect_foods(file: UploadFile = File(...)):
-    try:
-        print(f"\n🚀 Starting AI-driven analysis for: {file.filename}")
+    def normalize_ingredient_name(self, name: str) -> str:
+        """Normalize ingredient names for better matching"""
+        # Remove common words and normalize
+        name = re.sub(r'\b(fresh|organic|raw|cooked|frozen|dried|canned|sliced|diced)\b', '', name)
+        name = re.sub(r'\b(piece|pieces|slice|slices|cup|cups|lb|lbs|oz)\b', '', name)
+        name = re.sub(r'\s+', ' ', name).strip()
         
-        # Read and preprocess image
-        contents = await file.read()
-        enhanced_contents = preprocess_image(contents)
-        image_base64 = base64.b64encode(enhanced_contents).decode("utf-8")
+        # Handle plurals
+        if name.endswith('ies'):
+            name = name[:-3] + 'y'
+        elif name.endswith('es') and len(name) > 4:
+            if name.endswith('ches') or name.endswith('shes'):
+                name = name[:-2]
+            else:
+                name = name[:-1]
+        elif name.endswith('s') and len(name) > 3:
+            name = name[:-1]
         
-        # Run both AI systems simultaneously
-        all_detected_items = []
+        return name
+
+    def merge_detections(self, gemini_items: List[Dict], clarifai_items: List[Dict], 
+                        blip_items: List[Dict]) -> Dict:
+        """Merge results from all three AI services"""
+        all_items = []
+        ingredient_votes = {}
         
-        # Get Clarifai results
-        clarifai_items = query_clarifai_models(image_base64)
-        all_detected_items.extend(clarifai_items)
+        # Combine all items
+        for items_list in [gemini_items, clarifai_items, blip_items]:
+            all_items.extend(items_list)
         
-        # Get OpenAI results
-        openai_items = query_openai_vision(image_base64)
-        all_detected_items.extend(openai_items)
+        # Group by normalized names and merge
+        for item in all_items:
+            normalized_name = self.normalize_ingredient_name(item['name'])
+            
+            if normalized_name not in ingredient_votes:
+                ingredient_votes[normalized_name] = {
+                    'names': [],
+                    'confidences': [],
+                    'sources': [],
+                    'total_confidence': 0,
+                    'count': 0
+                }
+            
+            ingredient_votes[normalized_name]['names'].append(item['name'])
+            ingredient_votes[normalized_name]['confidences'].append(item['confidence'])
+            ingredient_votes[normalized_name]['sources'].append(item['source'])
+            ingredient_votes[normalized_name]['total_confidence'] += item['confidence']
+            ingredient_votes[normalized_name]['count'] += 1
         
-        print(f"\n📊 Raw Detection Results:")
-        print(f"Clarifai detected: {len(clarifai_items)} items")
-        print(f"OpenAI detected: {len(openai_items)} items")
-        print(f"Total raw items: {len(all_detected_items)}")
+        # Create final ingredient list
+        final_items = []
+        for normalized_name, data in ingredient_votes.items():
+            # Use most common name
+            name_counts = Counter(data['names'])
+            best_name = name_counts.most_common(1)[0][0]
+            
+            # Calculate boosted confidence for multiple AI agreement
+            avg_confidence = data['total_confidence'] / data['count']
+            unique_sources = len(set(data['sources']))
+            
+            # Boost confidence for multiple AI detections
+            if unique_sources >= 3:
+                final_confidence = min(avg_confidence + 25, 98)
+                source = 'all_three_ais'
+            elif unique_sources == 2:
+                final_confidence = min(avg_confidence + 15, 95)
+                source = 'two_ais'
+            else:
+                final_confidence = avg_confidence
+                source = data['sources'][0]
+            
+            final_items.append({
+                'name': best_name,
+                'confidence': int(final_confidence),
+                'source': source,
+                'detection_count': data['count'],
+                'detected_by': list(set(data['sources']))
+            })
         
-        # Merge duplicates and boost confidence for agreements
-        merged_results = merge_duplicate_items(all_detected_items)
-        
-        print(f"Final merged items: {len(merged_results)}")
+        # Sort by confidence
+        final_items.sort(key=lambda x: x['confidence'], reverse=True)
         
         # Categorize by confidence levels
-        high_confidence = [item for item in merged_results if item['confidence'] >= 75]
-        medium_confidence = [item for item in merged_results if 50 <= item['confidence'] < 75]
-        low_confidence = [item for item in merged_results if 30 <= item['confidence'] < 50]
-        
-        # Count AI agreements
-        ai_agreements = len([item for item in merged_results if item['source'] == 'both_ais'])
-        
-        # Log top results
-        print(f"\n🎯 Top 10 Results:")
-        for i, item in enumerate(merged_results[:10]):
-            sources_indicator = "🤖🤖" if item['source'] == 'both_ais' else ("🧠" if item['source'] == 'openai' else "👁️")
-            print(f"  {i+1}. {item['name']} ({item['confidence']}%) {sources_indicator}")
+        high_confidence = [item for item in final_items if item['confidence'] >= 70]
+        medium_confidence = [item for item in final_items if 40 <= item['confidence'] < 70]
+        low_confidence = [item for item in final_items if item['confidence'] < 40]
         
         return {
-            "items": [item["name"] for item in merged_results],
-            "food_items": merged_results,
-            "high_confidence": high_confidence,
-            "medium_confidence": medium_confidence,
-            "low_confidence": low_confidence,
-            "total_food_detected": len(merged_results),
-            "ai_agreements": ai_agreements,
-            "agreement_percentage": round((ai_agreements / len(merged_results) * 100), 1) if merged_results else 0,
-            "clarifai_detected": len(clarifai_items),
-            "openai_detected": len(openai_items),
-            "raw_total": len(all_detected_items),
-            "duplicates_merged": len(all_detected_items) - len(merged_results),
-            "ai_enhanced": True,
-            "analysis_method": "dual_ai_enhanced"
+            'items': [item['name'] for item in final_items],
+            'high_confidence': high_confidence,
+            'medium_confidence': medium_confidence,
+            'low_confidence': low_confidence,
+            'total_food_detected': len(final_items),
+            'ai_enhanced': True,
+            'detection_sources': ['gemini', 'clarifai', 'blip2']
         }
 
-    except Exception as e:
-        print(f"❌ Error in detect_foods: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-class SpoonacularClient:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.base_url = "https://api.spoonacular.com"
-        self.headers = {"Content-Type": "application/json"}
-    
-    def find_recipes_by_ingredients(self, ingredients: List[str], number: int = 10) -> List[Dict]:
-        """Find recipes that can be made with the given ingredients"""
-        if not ingredients:
-            return []
-        
-        # Clean and format ingredients for Spoonacular
-        formatted_ingredients = [ingredient.strip().lower() for ingredient in ingredients]
-        ingredients_string = ",".join(formatted_ingredients)
-        
-        url = f"{self.base_url}/recipes/findByIngredients"
-        params = {
-            "apiKey": self.api_key,
-            "ingredients": ingredients_string,
-            "number": number,
-            "ranking": 2,  # Maximize used ingredients
-            "ignorePantry": False,  # Include common pantry items
-            "limitLicense": False
-        }
-        
+    def get_recipe_details(self, recipe_id: int) -> Dict:
+        """Get detailed recipe information including nutrition"""
         try:
-            print(f"🍳 Searching Spoonacular with ingredients: {ingredients_string}")
-            response = requests.get(url, params=params, timeout=15)
+            url = f"https://api.spoonacular.com/recipes/{recipe_id}/information"
+            params = {
+                'apiKey': SPOONACULAR_API_KEY,
+                'includeNutrition': True
+            }
+            
+            response = requests.get(url, params=params, timeout=30)
             
             if response.status_code == 200:
-                recipes = response.json()
-                print(f"✅ Found {len(recipes)} recipes")
-                return recipes
-            else:
-                print(f"❌ Spoonacular API error: {response.status_code}")
-                return []
+                recipe_data = response.json()
+                
+                # Extract nutrition info
+                nutrition = {}
+                if 'nutrition' in recipe_data and 'nutrients' in recipe_data['nutrition']:
+                    for nutrient in recipe_data['nutrition']['nutrients']:
+                        name = nutrient.get('name', '').lower()
+                        if name in ['calories', 'fat', 'protein', 'carbohydrates', 'fiber', 'sugar']:
+                            nutrition[name] = {
+                                'amount': nutrient.get('amount', 0),
+                                'unit': nutrient.get('unit', '')
+                            }
+                
+                # Extract detailed recipe info
+                detailed_recipe = {
+                    'id': recipe_data.get('id'),
+                    'name': recipe_data.get('title', ''),
+                    'description': recipe_data.get('summary', '').replace('<b>', '').replace('</b>', ''),
+                    'image': recipe_data.get('image', ''),
+                    'ready_in_minutes': recipe_data.get('readyInMinutes', 0),
+                    'servings': recipe_data.get('servings', 1),
+                    'source_url': recipe_data.get('sourceUrl', ''),
+                    'spoonacular_url': recipe_data.get('spoonacularSourceUrl', ''),
+                    'instructions': [],
+                    'ingredients': [],
+                    'nutrition': nutrition,
+                    'diet_types': recipe_data.get('diets', []),
+                    'cuisines': recipe_data.get('cuisines', []),
+                    'dish_types': recipe_data.get('dishTypes', [])
+                }
+                
+                # Extract instructions
+                if 'analyzedInstructions' in recipe_data:
+                    for instruction_group in recipe_data['analyzedInstructions']:
+                        if 'steps' in instruction_group:
+                            for step in instruction_group['steps']:
+                                detailed_recipe['instructions'].append({
+                                    'step': step.get('number', 0),
+                                    'instruction': step.get('step', '')
+                                })
+                
+                # Extract ingredients
+                if 'extendedIngredients' in recipe_data:
+                    for ingredient in recipe_data['extendedIngredients']:
+                        detailed_recipe['ingredients'].append({
+                            'name': ingredient.get('name', ''),
+                            'amount': ingredient.get('amount', 0),
+                            'unit': ingredient.get('unit', ''),
+                            'original': ingredient.get('original', '')
+                        })
+                
+                return detailed_recipe
                 
         except Exception as e:
-            print(f"❌ Spoonacular request failed: {e}")
-            return []
-    
-    def get_recipe_details(self, recipe_id: int) -> Optional[Dict]:
-        """Get detailed information about a specific recipe"""
-        url = f"{self.base_url}/recipes/{recipe_id}/information"
-        params = {
-            "apiKey": self.api_key,
-            "includeNutrition": False
-        }
-        
+            logger.error(f"Recipe details error: {e}")
+            return {}
+
+    def get_recipe_suggestions(self, ingredients: List[str], max_recipes: int = 8) -> Dict:
+        """Get recipe suggestions with enhanced details"""
         try:
-            response = requests.get(url, params=params, timeout=10)
+            # Clean ingredients list
+            cleaned_ingredients = [ing.strip().lower() for ing in ingredients if ing.strip()]
+            ingredients_str = ','.join(cleaned_ingredients[:20])  # Limit to 20 ingredients
+            
+            url = "https://api.spoonacular.com/recipes/findByIngredients"
+            params = {
+                'apiKey': SPOONACULAR_API_KEY,
+                'ingredients': ingredients_str,
+                'number': max_recipes,
+                'limitLicense': True,
+                'ranking': 2,  # Maximize used ingredients
+                'ignorePantry': False
+            }
+            
+            response = requests.get(url, params=params, timeout=30)
+            
             if response.status_code == 200:
-                return response.json()
-            return None
-        except Exception as e:
-            print(f"❌ Failed to get recipe details for {recipe_id}: {e}")
-            return None
-    
-    def get_bulk_recipe_details(self, recipe_ids: List[int]) -> List[Dict]:
-        """Get details for multiple recipes in one call"""
-        if not recipe_ids:
-            return []
-        
-        ids_string = ",".join(str(id) for id in recipe_ids)
-        url = f"{self.base_url}/recipes/informationBulk"
-        params = {
-            "apiKey": self.api_key,
-            "ids": ids_string,
-            "includeNutrition": False
-        }
-        
-        try:
-            response = requests.get(url, params=params, timeout=15)
-            if response.status_code == 200:
-                return response.json()
-            return []
-        except Exception as e:
-            print(f"❌ Failed to get bulk recipe details: {e}")
-            return []
-
-# Initialize Spoonacular client - FIXED
-spoonacular_client = SpoonacularClient(SPOONACULAR_API_KEY) if SPOONACULAR_API_KEY and SPOONACULAR_API_KEY != "api_key_here" else None
-
-def process_spoonacular_recipes(raw_recipes: List[Dict], available_ingredients: List[str]) -> List[Dict]:
-    """Process and enhance Spoonacular recipe results"""
-    processed_recipes = []
-    
-    for recipe in raw_recipes:
-        # Calculate recipe metrics
-        used_ingredients = recipe.get('usedIngredients', [])
-        missed_ingredients = recipe.get('missedIngredients', [])
-        
-        used_count = len(used_ingredients)
-        missed_count = len(missed_ingredients)
-        total_ingredients = used_count + missed_count
-        
-        # Calculate match percentage
-        match_percentage = (used_count / total_ingredients * 100) if total_ingredients > 0 else 0
-        
-        # Determine if recipe is "ready to cook" (missing <= 2 ingredients)
-        ready_to_cook = missed_count <= 2
-        
-        # Extract ingredient names
-        used_ingredient_names = [ing['name'] for ing in used_ingredients]
-        missed_ingredient_names = [ing['name'] for ing in missed_ingredients]
-        
-        processed_recipe = {
-            "id": recipe.get('id'),
-            "name": recipe.get('title'),
-            "image": recipe.get('image'),
-            "used_ingredients": used_ingredient_names,
-            "missed_ingredients": missed_ingredient_names,
-            "used_ingredient_count": used_count,
-            "missed_ingredient_count": missed_count,
-            "match_percentage": round(match_percentage, 1),
-            "ready_to_cook": ready_to_cook,
-            "difficulty": "Easy" if missed_count <= 1 else "Medium" if missed_count <= 3 else "Hard",
-            "spoonacular_score": recipe.get('likes', 0)
-        }
-        
-        processed_recipes.append(processed_recipe)
-    
-    # Sort by match percentage, then by likes
-    processed_recipes.sort(key=lambda x: (x['match_percentage'], x['spoonacular_score']), reverse=True)
-    
-    return processed_recipes
-
-def get_recipe_suggestions(ingredients: List[str], max_recipes: int = 8) -> Dict:
-    """Get recipe suggestions based on available ingredients"""
-    if not spoonacular_client:
-        return {
-            "error": "Spoonacular API not configured",
-            "recipes": [],
-            "total_found": 0
-        }
-    
-    if not ingredients:
-        return {
-            "error": "No ingredients provided",
-            "recipes": [],
-            "total_found": 0
-        }
-    
-    # Filter ingredients to focus on food items (remove very generic terms)
-    filtered_ingredients = []
-    generic_terms = {'food', 'item', 'object', 'product', 'container', 'package'}
-    
-    for ingredient in ingredients:
-        if ingredient.lower().strip() not in generic_terms and len(ingredient.strip()) > 2:
-            filtered_ingredients.append(ingredient.strip())
-    
-    print(f"🔍 Filtered ingredients for recipe search: {filtered_ingredients}")
-    
-    # Get recipes from Spoonacular
-    raw_recipes = spoonacular_client.find_recipes_by_ingredients(
-        filtered_ingredients, 
-        number=max_recipes * 2  # Get more to have better filtering options
-    )
-    
-    if not raw_recipes:
-        return {
-            "message": "No recipes found with current ingredients",
-            "recipes": [],
-            "total_found": 0,
-            "ingredients_used": filtered_ingredients
-        }
-    
-    # Process and rank recipes
-    processed_recipes = process_spoonacular_recipes(raw_recipes, filtered_ingredients)
-    
-    # Limit to requested number
-    final_recipes = processed_recipes[:max_recipes]
-    
-    # Calculate summary statistics
-    ready_to_cook_count = len([r for r in final_recipes if r['ready_to_cook']])
-    avg_match_percentage = sum(r['match_percentage'] for r in final_recipes) / len(final_recipes) if final_recipes else 0
-    
-    return {
-        "recipes": final_recipes,
-        "total_found": len(raw_recipes),
-        "recipes_returned": len(final_recipes),
-        "ready_to_cook_count": ready_to_cook_count,
-        "average_match_percentage": round(avg_match_percentage, 1),
-        "ingredients_used": filtered_ingredients,
-        "api_source": "spoonacular"
-    }
-
-@app.post("/suggest_meals")
-async def suggest_meals(request_data: dict):
-    """Enhanced meal suggestions using Spoonacular API"""
-    try:
-        # Extract ingredients from request
-        ingredients = request_data.get("ingredients", [])
-        if isinstance(ingredients, str):
-            ingredients = [ingredients]
-        
-        max_recipes = request_data.get("max_recipes", 8)
-        
-        print(f"\n🍽️ Generating meal suggestions for {len(ingredients)} ingredients")
-        
-        # Get recipe suggestions
-        suggestions = get_recipe_suggestions(ingredients, max_recipes)
-        
-        # Add metadata
-        suggestions["timestamp"] = "2025-08-19T" + str(len(ingredients))  # Simple timestamp
-        suggestions["service_status"] = "active" if spoonacular_client else "limited"
-        
-        return suggestions
-        
-    except Exception as e:
-        print(f"❌ Error in suggest_meals: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Recipe suggestion failed: {str(e)}")
-
-@app.get("/recipe/{recipe_id}")
-async def get_recipe_details_endpoint(recipe_id: int):
-    """Get detailed information about a specific recipe"""
-    if not spoonacular_client:
-        raise HTTPException(status_code=503, detail="Spoonacular API not configured")
-    
-    try:
-        recipe_details = spoonacular_client.get_recipe_details(recipe_id)
-        
-        if not recipe_details:
-            raise HTTPException(status_code=404, detail="Recipe not found")
-        
-        # Extract key information
-        processed_details = {
-            "id": recipe_details.get("id"),
-            "title": recipe_details.get("title"),
-            "image": recipe_details.get("image"),
-            "ready_in_minutes": recipe_details.get("readyInMinutes"),
-            "servings": recipe_details.get("servings"),
-            "source_url": recipe_details.get("sourceUrl"),
-            "spoonacular_url": recipe_details.get("spoonacularSourceUrl"),
-            "instructions": recipe_details.get("instructions", ""),
-            "summary": recipe_details.get("summary", ""),
-            "ingredients": [
-                {
-                    "name": ing.get("name"),
-                    "amount": ing.get("amount"),
-                    "unit": ing.get("unit")
+                recipes_data = response.json()
+                processed_recipes = []
+                ready_to_cook_count = 0
+                total_match_percentage = 0
+                
+                for recipe in recipes_data:
+                    # Get detailed recipe information
+                    recipe_details = self.get_recipe_details(recipe.get('id'))
+                    
+                    # Extract basic recipe information
+                    used_ingredients = [ing['name'].lower() for ing in recipe.get('usedIngredients', [])]
+                    missed_ingredients = [ing['name'].lower() for ing in recipe.get('missedIngredients', [])]
+                    
+                    used_count = len(used_ingredients)
+                    missed_count = len(missed_ingredients)
+                    total_ingredients = used_count + missed_count
+                    
+                    match_percentage = int((used_count / total_ingredients * 100)) if total_ingredients > 0 else 0
+                    ready_to_cook = missed_count <= 2
+                    
+                    if ready_to_cook:
+                        ready_to_cook_count += 1
+                    
+                    total_match_percentage += match_percentage
+                    
+                    # Determine difficulty
+                    if missed_count == 0:
+                        difficulty = "Easy"
+                    elif missed_count <= 2:
+                        difficulty = "Medium" 
+                    else:
+                        difficulty = "Hard"
+                    
+                    processed_recipe = {
+                        'id': recipe.get('id'),
+                        'name': recipe.get('title', ''),
+                        'description': recipe_details.get('description', '')[:200] + '...' if recipe_details.get('description') else '',
+                        'image': recipe.get('image', ''),
+                        'used_ingredients': used_ingredients,
+                        'missed_ingredients': missed_ingredients,
+                        'used_ingredient_count': used_count,
+                        'missed_ingredient_count': missed_count,
+                        'match_percentage': match_percentage,
+                        'ready_to_cook': ready_to_cook,
+                        'difficulty': difficulty,
+                        'spoonacular_score': recipe.get('likes', 0),
+                        'ready_in_minutes': recipe_details.get('ready_in_minutes', 0),
+                        'servings': recipe_details.get('servings', 1),
+                        'nutrition': recipe_details.get('nutrition', {}),
+                        'diet_types': recipe_details.get('diet_types', []),
+                        'cuisines': recipe_details.get('cuisines', []),
+                        'source_url': recipe_details.get('source_url', ''),
+                        'spoonacular_url': recipe_details.get('spoonacular_url', ''),
+                        'full_recipe': recipe_details  # Include full recipe for detailed view
+                    }
+                    
+                    processed_recipes.append(processed_recipe)
+                
+                # Sort by match percentage and readiness
+                processed_recipes.sort(key=lambda x: (x['match_percentage'], -x['missed_ingredient_count']), reverse=True)
+                
+                avg_match = int(total_match_percentage / len(processed_recipes)) if processed_recipes else 0
+                
+                return {
+                    'recipes': processed_recipes,
+                    'ready_to_cook_count': ready_to_cook_count,
+                    'average_match_percentage': avg_match,
+                    'total_recipes_found': len(processed_recipes),
+                    'search_ingredients': cleaned_ingredients
                 }
-                for ing in recipe_details.get("extendedIngredients", [])
-            ]
-        }
+            else:
+                logger.error(f"Spoonacular API error: {response.status_code} - {response.text}")
+                return {'recipes': [], 'error': 'Recipe service unavailable'}
+                
+        except Exception as e:
+            logger.error(f"Recipe suggestion error: {e}")
+            return {'recipes': [], 'error': str(e)}
+
+# Initialize the service
+food_detector = FoodDetectionService()
+
+@app.route('/detect_foods', methods=['POST'])
+def detect_foods():
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file uploaded'}), 400
         
-        return processed_details
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
         
-    except HTTPException:
-        raise
+        # Read image data
+        image_data = file.read()
+        
+        # Run all three AI detections
+        logger.info("Starting food detection with Gemini, Clarifai, and BLIP-2...")
+        
+        gemini_results = food_detector.detect_with_gemini(image_data)
+        logger.info(f"Gemini detected {len(gemini_results)} items")
+        
+        clarifai_results = food_detector.detect_with_clarifai(image_data)
+        logger.info(f"Clarifai detected {len(clarifai_results)} items")
+        
+        blip_results = food_detector.detect_with_blip(image_data)
+        logger.info(f"BLIP-2 detected {len(blip_results)} items")
+        
+        # Merge all results
+        final_results = food_detector.merge_detections(
+            gemini_results, clarifai_results, blip_results
+        )
+        
+        logger.info(f"Final merged results: {final_results['total_food_detected']} unique ingredients")
+        
+        return jsonify(final_results)
+        
     except Exception as e:
-        print(f"❌ Error getting recipe details: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to fetch recipe details")
+        logger.error(f"Detection error: {e}")
+        return jsonify({'error': f'Detection failed: {str(e)}'}), 500
 
-@app.get("/")
-async def root():
-    ai_status = "enabled" if openai_client else "disabled"
-    return {
-        "message": "MealMapper Dual-AI Enhanced API",
-        "version": "4.0",
-        "ai_systems": {
-            "clarifai": "enabled",
-            "openai_vision": ai_status
-        },
-        "features": ["smart_duplicate_merging", "confidence_boosting", "ai_agreement_detection"]
-    }
+@app.route('/suggest_meals', methods=['POST'])
+def suggest_meals():
+    try:
+        data = request.get_json()
+        ingredients = data.get('ingredients', [])
+        max_recipes = data.get('max_recipes', 8)
+        
+        if not ingredients:
+            return jsonify({'error': 'No ingredients provided'}), 400
+        
+        logger.info(f"Getting recipe suggestions for {len(ingredients)} ingredients")
+        
+        results = food_detector.get_recipe_suggestions(ingredients, max_recipes)
+        
+        return jsonify(results)
+        
+    except Exception as e:
+        logger.error(f"Recipe suggestion error: {e}")
+        return jsonify({'error': f'Recipe suggestion failed: {str(e)}'}), 500
 
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "clarifai_models": len(CLARIFAI_MODELS),
-        "openai_available": openai_client is not None,
-        "ai_systems": 2 if openai_client else 1
-    }
+@app.route('/recipe/<int:recipe_id>', methods=['GET'])
+def get_recipe_detail(recipe_id):
+    """Get detailed recipe information"""
+    try:
+        recipe_details = food_detector.get_recipe_details(recipe_id)
+        
+        if recipe_details:
+            return jsonify(recipe_details)
+        else:
+            return jsonify({'error': 'Recipe not found'}), 404
+            
+    except Exception as e:
+        logger.error(f"Recipe detail error: {e}")
+        return jsonify({'error': f'Failed to get recipe details: {str(e)}'}), 500
 
-@app.get("/debug")
-async def debug_info():
-    """Debug endpoint to check all AI system status - FIXED"""
-    return {
-        "clarifai_key_set": CLARIFAI_API_KEY != "api_key_here",
-        "openai_key_set": OPENAI_API_KEY != "api_key_here",  # FIXED
-        "spoonacular_key_set": SPOONACULAR_API_KEY != "api_key_here",  # FIXED
-        "openai_client_ready": openai_client is not None,
-        "spoonacular_client_ready": spoonacular_client is not None,
-        "models_configured": len(CLARIFAI_MODELS),
-        "all_services_ready": all([
-            CLARIFAI_API_KEY != "api_key_here",
-            openai_client is not None,
-            spoonacular_client is not None
-        ])
-    }
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({
+        'status': 'healthy good',
+        'services': {
+            'gemini': bool(os.getenv('GOOGLE_GEMINI_API_KEY')),
+            'clarifai': bool(os.getenv('CLARIFAI_API_KEY')),
+            'spoonacular': bool(os.getenv('SPOONACULAR_API_KEY')),
+            'blip2': True  # Hugging Face is always available
+        }
+    })
+
+if __name__ == '__main__':
+    # Check for required environment variables
+    required_vars = ['GOOGLE_GEMINI_API_KEY', 'CLARIFAI_API_KEY', 'SPOONACULAR_API_KEY']
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+    
+    if missing_vars:
+        logger.error(f"Missing required environment variables: {missing_vars}")
+        print(f"Please set the following environment variables: {missing_vars}")
+    else:
+        logger.info("All environment variables configured. Starting server...")
+        app.run(debug=True, host='0.0.0.0', port=5000)
