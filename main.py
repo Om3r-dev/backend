@@ -555,7 +555,10 @@ def health_check():
             'blip2': True  # Hugging Face is always available
         }
     })
-
+@app.route('/')
+def root():
+    return jsonify({'message': 'Recipe API is running', 'status': 'healthy'})
+    
 if __name__ == '__main__':
     # Check for required environment variables
     required_vars = ['GOOGLE_GEMINI_API_KEY', 'CLARIFAI_API_KEY', 'SPOONACULAR_API_KEY']
@@ -566,4 +569,5 @@ if __name__ == '__main__':
         print(f"Please set the following environment variables: {missing_vars}")
     else:
         logger.info("All environment variables configured. Starting server...")
+
         app.run(debug=True, host='0.0.0.0', port=5000)
