@@ -26,7 +26,7 @@ SPOONACULAR_API_KEY = os.getenv('SPOONACULAR_API_KEY')
 
 class FoodDetectionService:
     def __init__(self):
-        self.gemini_model = genai.GenerativeModel('gemini-pro-vision')
+        self.gemini_model = genai.GenerativeModel('gemini-2.0-flash')
         self.food_keywords = {
             'vegetables': ['carrot', 'broccoli', 'spinach', 'lettuce', 'tomato', 'cucumber', 
                           'bell pepper', 'red pepper', 'green pepper', 'yellow pepper', 'onion', 
@@ -50,7 +50,7 @@ class FoodDetectionService:
         }
 
     def detect_with_gemini(self, image_data: bytes) -> List[Dict]:
-        """Use Google Gemini Pro Vision to detect food items"""
+        """Use gemini-2.0-flash to detect food items"""
         try:
             image = Image.open(io.BytesIO(image_data))
             
@@ -129,6 +129,7 @@ class FoodDetectionService:
                     }
                 }]
             }
+            
             
             response = requests.post(url, json=payload, headers=headers, timeout=30)
             
@@ -309,7 +310,7 @@ class FoodDetectionService:
                 'apiKey': SPOONACULAR_API_KEY,
                 'includeNutrition': True
             }
-            
+
             response = requests.get(url, params=params, timeout=30)
             
             if response.status_code == 200:
@@ -370,6 +371,11 @@ class FoodDetectionService:
             logger.error(f"Recipe details error: {e}")
             return {}
 
+            # The Gemini model is set in the FoodDetectionService __init__ method:
+            # self.gemini_model = genai.GenerativeModel('gemini-pro-vision')
+            # This is located at line 23 in your file.
+            # self.gemini_model = genai.GenerativeModel('gemini-pro-vision')
+            # This line announces that the 'gemini-pro-vision' model is being used.
     def get_recipe_suggestions(self, ingredients: List[str], max_recipes: int = 8) -> Dict:
         """Get recipe suggestions with enhanced details"""
         try:
@@ -552,13 +558,13 @@ def health_check():
             'gemini': bool(os.getenv('GOOGLE_GEMINI_API_KEY')),
             'clarifai': bool(os.getenv('CLARIFAI_API_KEY')),
             'spoonacular': bool(os.getenv('SPOONACULAR_API_KEY')),
-            'blip2': True  # Hugging Face is always available
+            'blip2': True
         }
     })
 @app.route('/')
 def root():
     return jsonify({'message': 'Recipe API is running', 'status': 'healthy'})
-    
+
 if __name__ == '__main__':
     # Check for required environment variables
     required_vars = ['GOOGLE_GEMINI_API_KEY', 'CLARIFAI_API_KEY', 'SPOONACULAR_API_KEY']
@@ -569,5 +575,4 @@ if __name__ == '__main__':
         print(f"Please set the following environment variables: {missing_vars}")
     else:
         logger.info("All environment variables configured. Starting server...")
-
         app.run(debug=True, host='0.0.0.0', port=5000)
