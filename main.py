@@ -26,7 +26,7 @@ SPOONACULAR_API_KEY = os.getenv('SPOONACULAR_API_KEY')
 
 class FoodDetectionService:
     def __init__(self):
-        self.gemini_model = genai.GenerativeModel('gemini-pro-vision')
+        self.gemini_model = genai.GenerativeModel('gemini-2.0-flash')
         self.food_keywords = {
             'vegetables': ['carrot', 'broccoli', 'spinach', 'lettuce', 'tomato', 'cucumber', 
                           'bell pepper', 'red pepper', 'green pepper', 'yellow pepper', 'onion', 
@@ -50,7 +50,7 @@ class FoodDetectionService:
         }
 
     def detect_with_gemini(self, image_data: bytes) -> List[Dict]:
-        """Use Google Gemini Pro Vision to detect food items"""
+        """Use Google gemini-2.0-flash to detect food items"""
         try:
             if not image_data:
                 logger.warning("No image data provided to Gemini")
