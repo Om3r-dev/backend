@@ -26,7 +26,7 @@ SPOONACULAR_API_KEY = os.getenv('SPOONACULAR_API_KEY')
 
 class FoodDetectionService:
     def __init__(self):
-        self.gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+        self.gemini_model = genai.GenerativeModel('gemini-pro-vision')
         self.food_keywords = {
             'vegetables': ['carrot', 'broccoli', 'spinach', 'lettuce', 'tomato', 'cucumber', 
                           'bell pepper', 'red pepper', 'green pepper', 'yellow pepper', 'onion', 
@@ -50,8 +50,12 @@ class FoodDetectionService:
         }
 
     def detect_with_gemini(self, image_data: bytes) -> List[Dict]:
-        """Use gemini-2.0-flash to detect food items"""
+        """Use Google Gemini Pro Vision to detect food items"""
         try:
+            if not image_data:
+                logger.warning("No image data provided to Gemini")
+                return []
+                
             image = Image.open(io.BytesIO(image_data))
             
             prompt = """
@@ -72,17 +76,23 @@ class FoodDetectionService:
             
             response = self.gemini_model.generate_content([prompt, image])
             
-            if response.text:
+            if response and response.text:
                 # Try to extract JSON array from response
                 json_match = re.search(r'\[(.*?)\]', response.text.replace('\n', ''), re.DOTALL)
                 if json_match:
                     try:
                         items = json.loads('[' + json_match.group(1) + ']')
-                        return [{'name': item['name'].lower().strip(), 
-                               'confidence': min(item['confidence'], 95), 
-                               'source': 'gemini'} for item in items if item.get('name')]
-                    except json.JSONDecodeError:
-                        pass
+                        valid_items = []
+                        for item in items:
+                            if isinstance(item, dict) and item.get('name') and item.get('confidence'):
+                                valid_items.append({
+                                    'name': str(item['name']).lower().strip(),
+                                    'confidence': min(int(item['confidence']), 95),
+                                    'source': 'gemini'
+                                })
+                        return valid_items[:25]
+                    except (json.JSONDecodeError, ValueError, KeyError) as e:
+                        logger.warning(f"JSON parsing error: {e}")
                 
                 # Fallback: extract ingredients from text
                 items = []
@@ -104,6 +114,9 @@ class FoodDetectionService:
                                 })
                 
                 return items[:25]
+            else:
+                logger.warning("No response text from Gemini")
+                return []
                 
         except Exception as e:
             logger.error(f"Gemini detection error: {e}")
@@ -112,6 +125,14 @@ class FoodDetectionService:
     def detect_with_clarifai(self, image_data: bytes) -> List[Dict]:
         """Use Clarifai Food Model to detect food items"""
         try:
+            if not image_data:
+                logger.warning("No image data provided to Clarifai")
+                return []
+                
+            if not CLARIFAI_API_KEY:
+                logger.warning("Clarifai API key not configured")
+                return []
+                
             image_b64 = base64.b64encode(image_data).decode('utf-8')
             
             url = "https://api.clarifai.com/v2/models/food-item-recognition/outputs"
@@ -130,14 +151,16 @@ class FoodDetectionService:
                 }]
             }
             
-            
             response = requests.post(url, json=payload, headers=headers, timeout=30)
             
             if response.status_code == 200:
                 data = response.json()
                 items = []
                 
-                if data.get('outputs') and data['outputs'][0].get('data', {}).get('concepts'):
+                if (data and data.get('outputs') and 
+                    len(data['outputs']) > 0 and 
+                    data['outputs'][0].get('data', {}).get('concepts')):
+                    
                     for concept in data['outputs'][0]['data']['concepts']:
                         name = concept.get('name', '').lower().strip()
                         confidence = concept.get('value', 0) * 100
@@ -150,6 +173,9 @@ class FoodDetectionService:
                             })
                 
                 return items[:20]
+            else:
+                logger.warning(f"Clarifai API returned status {response.status_code}")
+                return []
                 
         except Exception as e:
             logger.error(f"Clarifai detection error: {e}")
@@ -158,6 +184,10 @@ class FoodDetectionService:
     def detect_with_blip(self, image_data: bytes) -> List[Dict]:
         """Use Hugging Face BLIP-2 to detect food items"""
         try:
+            if not image_data:
+                logger.warning("No image data provided to BLIP")
+                return []
+                
             image_b64 = base64.b64encode(image_data).decode('utf-8')
             
             # Use Hugging Face Inference API for BLIP-2
@@ -178,11 +208,10 @@ class FoodDetectionService:
                 data = response.json()
                 items = []
                 
-                if isinstance(data, list) and len(data) > 0:
-                    description = data[0].get('generated_text', '').lower()
+                if isinstance(data, list) and len(data) > 0 and data[0].get('generated_text'):
+                    description = data[0]['generated_text'].lower()
                     
                     # Extract food ingredients from the description
-                    food_words = []
                     for category, keywords in self.food_keywords.items():
                         for keyword in keywords:
                             if keyword in description:
@@ -200,6 +229,9 @@ class FoodDetectionService:
                                     })
                 
                 return items[:15]
+            else:
+                logger.warning(f"BLIP API returned status {response.status_code}")
+                return []
                 
         except Exception as e:
             logger.error(f"BLIP detection error: {e}")
@@ -207,6 +239,9 @@ class FoodDetectionService:
 
     def normalize_ingredient_name(self, name: str) -> str:
         """Normalize ingredient names for better matching"""
+        if not name or not isinstance(name, str):
+            return ""
+            
         # Remove common words and normalize
         name = re.sub(r'\b(fresh|organic|raw|cooked|frozen|dried|canned|sliced|diced)\b', '', name)
         name = re.sub(r'\b(piece|pieces|slice|slices|cup|cups|lb|lbs|oz)\b', '', name)
@@ -228,16 +263,39 @@ class FoodDetectionService:
     def merge_detections(self, gemini_items: List[Dict], clarifai_items: List[Dict], 
                         blip_items: List[Dict]) -> Dict:
         """Merge results from all three AI services"""
+        # Ensure all inputs are lists (handle None values)
+        gemini_items = gemini_items if gemini_items is not None else []
+        clarifai_items = clarifai_items if clarifai_items is not None else []
+        blip_items = blip_items if blip_items is not None else []
+        
         all_items = []
         ingredient_votes = {}
         
         # Combine all items
         for items_list in [gemini_items, clarifai_items, blip_items]:
-            all_items.extend(items_list)
+            if items_list and isinstance(items_list, list):
+                all_items.extend(items_list)
+        
+        if not all_items:
+            logger.warning("No items detected by any AI service")
+            return {
+                'items': [],
+                'high_confidence': [],
+                'medium_confidence': [],
+                'low_confidence': [],
+                'total_food_detected': 0,
+                'ai_enhanced': False,
+                'detection_sources': []
+            }
         
         # Group by normalized names and merge
         for item in all_items:
+            if not isinstance(item, dict) or not item.get('name'):
+                continue
+                
             normalized_name = self.normalize_ingredient_name(item['name'])
+            if not normalized_name:
+                continue
             
             if normalized_name not in ingredient_votes:
                 ingredient_votes[normalized_name] = {
@@ -249,14 +307,17 @@ class FoodDetectionService:
                 }
             
             ingredient_votes[normalized_name]['names'].append(item['name'])
-            ingredient_votes[normalized_name]['confidences'].append(item['confidence'])
-            ingredient_votes[normalized_name]['sources'].append(item['source'])
-            ingredient_votes[normalized_name]['total_confidence'] += item['confidence']
+            ingredient_votes[normalized_name]['confidences'].append(item.get('confidence', 50))
+            ingredient_votes[normalized_name]['sources'].append(item.get('source', 'unknown'))
+            ingredient_votes[normalized_name]['total_confidence'] += item.get('confidence', 50)
             ingredient_votes[normalized_name]['count'] += 1
         
         # Create final ingredient list
         final_items = []
         for normalized_name, data in ingredient_votes.items():
+            if data['count'] == 0:
+                continue
+                
             # Use most common name
             name_counts = Counter(data['names'])
             best_name = name_counts.most_common(1)[0][0]
@@ -274,7 +335,7 @@ class FoodDetectionService:
                 source = 'two_ais'
             else:
                 final_confidence = avg_confidence
-                source = data['sources'][0]
+                source = data['sources'][0] if data['sources'] else 'unknown'
             
             final_items.append({
                 'name': best_name,
@@ -298,19 +359,23 @@ class FoodDetectionService:
             'medium_confidence': medium_confidence,
             'low_confidence': low_confidence,
             'total_food_detected': len(final_items),
-            'ai_enhanced': True,
+            'ai_enhanced': len(final_items) > 0,
             'detection_sources': ['gemini', 'clarifai', 'blip2']
         }
 
     def get_recipe_details(self, recipe_id: int) -> Dict:
         """Get detailed recipe information including nutrition"""
         try:
+            if not SPOONACULAR_API_KEY:
+                logger.warning("Spoonacular API key not configured")
+                return {}
+                
             url = f"https://api.spoonacular.com/recipes/{recipe_id}/information"
             params = {
                 'apiKey': SPOONACULAR_API_KEY,
                 'includeNutrition': True
             }
-
+            
             response = requests.get(url, params=params, timeout=30)
             
             if response.status_code == 200:
@@ -366,21 +431,29 @@ class FoodDetectionService:
                         })
                 
                 return detailed_recipe
+            else:
+                logger.warning(f"Spoonacular recipe details API returned status {response.status_code}")
+                return {}
                 
         except Exception as e:
             logger.error(f"Recipe details error: {e}")
             return {}
 
-            # The Gemini model is set in the FoodDetectionService __init__ method:
-            # self.gemini_model = genai.GenerativeModel('gemini-pro-vision')
-            # This is located at line 23 in your file.
-            # self.gemini_model = genai.GenerativeModel('gemini-pro-vision')
-            # This line announces that the 'gemini-pro-vision' model is being used.
     def get_recipe_suggestions(self, ingredients: List[str], max_recipes: int = 8) -> Dict:
         """Get recipe suggestions with enhanced details"""
         try:
+            if not SPOONACULAR_API_KEY:
+                logger.error("Spoonacular API key not configured")
+                return {'recipes': [], 'error': 'Recipe service not configured'}
+                
+            if not ingredients:
+                return {'recipes': [], 'error': 'No ingredients provided'}
+            
             # Clean ingredients list
-            cleaned_ingredients = [ing.strip().lower() for ing in ingredients if ing.strip()]
+            cleaned_ingredients = [ing.strip().lower() for ing in ingredients if ing and ing.strip()]
+            if not cleaned_ingredients:
+                return {'recipes': [], 'error': 'No valid ingredients provided'}
+                
             ingredients_str = ','.join(cleaned_ingredients[:20])  # Limit to 20 ingredients
             
             url = "https://api.spoonacular.com/recipes/findByIngredients"
@@ -397,13 +470,26 @@ class FoodDetectionService:
             
             if response.status_code == 200:
                 recipes_data = response.json()
+                
+                if not recipes_data:
+                    return {
+                        'recipes': [],
+                        'ready_to_cook_count': 0,
+                        'average_match_percentage': 0,
+                        'total_recipes_found': 0,
+                        'search_ingredients': cleaned_ingredients
+                    }
+                
                 processed_recipes = []
                 ready_to_cook_count = 0
                 total_match_percentage = 0
                 
                 for recipe in recipes_data:
+                    if not recipe:
+                        continue
+                        
                     # Get detailed recipe information
-                    recipe_details = self.get_recipe_details(recipe.get('id'))
+                    recipe_details = self.get_recipe_details(recipe.get('id')) if recipe.get('id') else {}
                     
                     # Extract basic recipe information
                     used_ingredients = [ing['name'].lower() for ing in recipe.get('usedIngredients', [])]
@@ -468,7 +554,7 @@ class FoodDetectionService:
                 }
             else:
                 logger.error(f"Spoonacular API error: {response.status_code} - {response.text}")
-                return {'recipes': [], 'error': 'Recipe service unavailable'}
+                return {'recipes': [], 'error': f'Recipe service returned error: {response.status_code}'}
                 
         except Exception as e:
             logger.error(f"Recipe suggestion error: {e}")
@@ -490,17 +576,20 @@ def detect_foods():
         # Read image data
         image_data = file.read()
         
-        # Run all three AI detections
+        if not image_data:
+            return jsonify({'error': 'Empty file uploaded'}), 400
+        
+        # Run all three AI detections with proper error handling
         logger.info("Starting food detection with Gemini, Clarifai, and BLIP-2...")
         
         gemini_results = food_detector.detect_with_gemini(image_data)
-        logger.info(f"Gemini detected {len(gemini_results)} items")
+        logger.info(f"Gemini detected {len(gemini_results) if gemini_results else 0} items")
         
         clarifai_results = food_detector.detect_with_clarifai(image_data)
-        logger.info(f"Clarifai detected {len(clarifai_results)} items")
+        logger.info(f"Clarifai detected {len(clarifai_results) if clarifai_results else 0} items")
         
         blip_results = food_detector.detect_with_blip(image_data)
-        logger.info(f"BLIP-2 detected {len(blip_results)} items")
+        logger.info(f"BLIP-2 detected {len(blip_results) if blip_results else 0} items")
         
         # Merge all results
         final_results = food_detector.merge_detections(
@@ -519,6 +608,9 @@ def detect_foods():
 def suggest_meals():
     try:
         data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+            
         ingredients = data.get('ingredients', [])
         max_recipes = data.get('max_recipes', 8)
         
@@ -553,7 +645,7 @@ def get_recipe_detail(recipe_id):
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({
-        'status': 'healthy good',
+        'status': 'healthy',
         'services': {
             'gemini': bool(os.getenv('GOOGLE_GEMINI_API_KEY')),
             'clarifai': bool(os.getenv('CLARIFAI_API_KEY')),
@@ -561,9 +653,10 @@ def health_check():
             'blip2': True
         }
     })
+
 @app.route('/')
 def root():
-    return jsonify({'message': 'Recipe API is running', 'status': 'healthy'})
+    return jsonify({'message': 'MealMapper API is running', 'status': 'healthy'})
 
 if __name__ == '__main__':
     # Check for required environment variables
@@ -575,4 +668,5 @@ if __name__ == '__main__':
         print(f"Please set the following environment variables: {missing_vars}")
     else:
         logger.info("All environment variables configured. Starting server...")
-        app.run(debug=True, host='0.0.0.0', port=5000)
+    
+    app.run(debug=True, host='0.0.0.0', port=5000)
