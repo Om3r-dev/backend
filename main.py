@@ -75,6 +75,7 @@ class FoodDetectionService:
             """
             
             response = self.gemini_model.generate_content([prompt, image])
+
             
             if response and response.text:
                 # Try to extract JSON array from response
@@ -392,7 +393,6 @@ class FoodDetectionService:
                                 'unit': nutrient.get('unit', '')
                             }
                 
-                # Extract detailed recipe info
                 detailed_recipe = {
                     'id': recipe_data.get('id'),
                     'name': recipe_data.get('title', ''),
@@ -562,43 +562,76 @@ class FoodDetectionService:
 
 # Initialize the service
 food_detector = FoodDetectionService()
-
 @app.route('/detect_foods', methods=['POST'])
 def detect_foods():
     try:
-        if 'file' not in request.files:
-            return jsonify({'error': 'No file uploaded'}), 400
+        # Change from 'file' to 'photos' to match React Native
+        if 'photos' not in request.files:
+            return jsonify({'error': 'No photos uploaded'}), 400
         
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({'error': 'No file selected'}), 400
+        files = request.files.getlist('photos')
+        logger.info(f"Received {len(files)} files")
+
+        all_results = []
         
-        # Read image data
-        image_data = file.read()
+        for idx, file in enumerate(files):
+            if file.filename == '':
+                continue
+            
+            image_data = file.read()
+            logger.info(f"File {idx}: size = {len(image_data)} bytes")
+            
+            if not image_data:
+                continue
+            
+            # Run detections on this image
+            logger.info(f"Running Gemini detection on file {idx}")
+            gemini_results = food_detector.detect_with_gemini(image_data)
+            logger.info(f"Gemini found {len(gemini_results)} items")
+            
+            logger.info(f"Running Clarifai detection on file {idx}")
+            clarifai_results = food_detector.detect_with_clarifai(image_data)
+            logger.info(f"Clarifai found {len(clarifai_results)} items")
+            
+            logger.info(f"Running BLIP detection on file {idx}")
+            blip_results = food_detector.detect_with_blip(image_data)
+            logger.info(f"BLIP found {len(blip_results)} items")
+            
+            # Merge results
+            image_results = food_detector.merge_detections(
+                gemini_results, clarifai_results, blip_results
+            )
+            
+            logger.info(f"Merged results: {len(image_results.get('items', []))} unique items")
+            all_results.append(image_results)
         
-        if not image_data:
-            return jsonify({'error': 'Empty file uploaded'}), 400
+        # Combine all ingredients from all images
+        combined_ingredients = []
+        for result in all_results:
+            combined_ingredients.extend(result.get('items', []))
         
-        # Run all three AI detections with proper error handling
-        logger.info("Starting food detection with Gemini, Clarifai, and BLIP-2...")
+        unique_ingredients = list(set(combined_ingredients))
         
-        gemini_results = food_detector.detect_with_gemini(image_data)
-        logger.info(f"Gemini detected {len(gemini_results) if gemini_results else 0} items")
+        logger.info(f"Final result: {len(unique_ingredients)} unique ingredients")
         
-        clarifai_results = food_detector.detect_with_clarifai(image_data)
-        logger.info(f"Clarifai detected {len(clarifai_results) if clarifai_results else 0} items")
+        return jsonify({
+            'items': unique_ingredients,
+            'total_food_detected': len(unique_ingredients),
+            'images_processed': len(all_results)
+        })
         
-        blip_results = food_detector.detect_with_blip(image_data)
-        logger.info(f"BLIP-2 detected {len(blip_results) if blip_results else 0} items")
+    except Exception as e:
+        logger.error(f"Detection error: {e}", exc_info=True)
+        return jsonify({'error': f'Detection failed: {str(e)}'}), 500
         
-        # Merge all results
-        final_results = food_detector.merge_detections(
-            gemini_results, clarifai_results, blip_results
-        )
+        # Remove duplicates
+        unique_ingredients = list(set(combined_ingredients))
         
-        logger.info(f"Final merged results: {final_results['total_food_detected']} unique ingredients")
-        
-        return jsonify(final_results)
+        return jsonify({
+            'items': unique_ingredients,
+            'total_food_detected': len(unique_ingredients),
+            'images_processed': len(all_results)
+        })
         
     except Exception as e:
         logger.error(f"Detection error: {e}")
